@@ -12,6 +12,10 @@ nix = { version = "0.30.1", features = ["ptrace", "socket", "uio"] }
 paste = "1.0.15"
 jni = "0.21.1"
 once_cell = "1.21.3"
+clear-cache = "0.1.2"
+
+[build-dependencies]
+cc  = "1.2.29"
 
 [lib]
 name = "agent"

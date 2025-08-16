@@ -760,7 +760,7 @@ fn main() {
                     // 使用 call_target_function 调用 shellcode
                     match call_target_function(args.pid, shellcode_addr, &[offsets_addr, dloffset_addr, string_table_addr],None) {
                         Ok(return_value) => {
-                            println!("Shellcode 执行完成，返回值: 0x{:x}", return_value);
+                            println!("Shellcode 执行完成，返回值: 0x{:x}", return_value as isize);
                             
                             // 释放shellcode内存
                             println!("正在释放shellcode内存...");

@@ -68,7 +68,7 @@ typedef void* (*memcpy_t)(void*, const void*, size_t);
 
 static int recv_fd(int sock, ssize_t (*recvmsg_fn)(int, struct msghdr*, int));
 
-void shellcode_entry(LibcOffsets* offsets, DlOffsets* dl, StringTable* table) {
+int shellcode_entry(LibcOffsets* offsets, DlOffsets* dl, StringTable* table) {
     // 定义函数指针
 //    malloc_t malloc = (malloc_t)offsets->malloc;
     free_t free = (free_t)offsets->free;
@@ -110,7 +110,7 @@ void shellcode_entry(LibcOffsets* offsets, DlOffsets* dl, StringTable* table) {
         free(offsets);
         free(dl);
         free(table);
-        return;
+        return -1;
     }
     
     // 准备地址结构
@@ -128,7 +128,7 @@ void shellcode_entry(LibcOffsets* offsets, DlOffsets* dl, StringTable* table) {
         free(offsets);
         free(dl);
         free(table);
-        return;
+        return -2;
     }
     
     // 发送hello消息
@@ -141,7 +141,7 @@ void shellcode_entry(LibcOffsets* offsets, DlOffsets* dl, StringTable* table) {
         free(offsets);
         free(dl);
         free(table);
-        return;
+        return -3;
     }
     
     // 构造 "/proc/self/fd/<memfd>" 路径
@@ -160,7 +160,7 @@ void shellcode_entry(LibcOffsets* offsets, DlOffsets* dl, StringTable* table) {
         free(offsets);
         free(dl);
         free(table);
-        return;
+        return -4;
     }
     
     // 加载共享库
@@ -171,7 +171,7 @@ void shellcode_entry(LibcOffsets* offsets, DlOffsets* dl, StringTable* table) {
         free(offsets);
         free(dl);
         free(table);
-        return;
+        return -5;
     }
     
     // 查找符号 (sym_name 已有 NULL 结尾，可直接使用)
@@ -198,6 +198,7 @@ void shellcode_entry(LibcOffsets* offsets, DlOffsets* dl, StringTable* table) {
     free(offsets);
     free(dl);
     free(table);
+    return 1;
 }
 
 static int recv_fd(int sock, ssize_t (*recvmsg_fn)(int, struct msghdr*, int)) {

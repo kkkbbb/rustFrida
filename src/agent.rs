@@ -1,13 +1,12 @@
 #![cfg(all(target_os = "android", target_arch = "aarch64"))]
-
 mod jhook;
 mod gumlibc;
+mod writer;
 
-use std::arch::asm;
 use crate::gumlibc::{gum_libc_ptrace, gum_libc_waitpid};
 use crate::jhook::jhook;
-use libc::{c_char, c_int, close, iovec, kill, mmap, munmap, pid_t, sockaddr, sockaddr_un, sysconf, AF_UNIX, CLONE_SETTLS, CLONE_VM, MAP_ANONYMOUS, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE, PTRACE_DETACH, SIGSTOP, _SC_PAGESIZE};
-use libc::{PTRACE_ATTACH, PTRACE_GETREGSET};
+use libc::{c_char, c_int, close, iovec, kill, mmap, munmap, pid_t, sockaddr, sockaddr_un, sysconf, AF_UNIX, CLONE_SETTLS, CLONE_VM, MAP_ANONYMOUS, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE, PTRACE_DETACH, SIGSTOP, _SC_PAGESIZE,SIGCONT};
+use libc::{PTRACE_ATTACH, PTRACE_GETREGSET, PTRACE_CONT};
 use nix::errno::Errno;
 use once_cell::unsync::Lazy;
 use std::ffi::c_void;
@@ -19,7 +18,8 @@ use std::os::unix::net::UnixStream;
 use std::process;
 use std::ptr;
 use std::ptr::null_mut;
-use std::sync::{LazyLock, Mutex, OnceLock};
+use std::sync::{ Mutex, OnceLock};
+use clear_cache::clear_cache;
 
 // 定义我们自己的Result类型，错误统一为String
 type Result<T> = std::result::Result<T, String>;
@@ -90,7 +90,7 @@ impl ExecMem {
         unsafe {
             // 申请新内存
             let new_ptr = mmap(
-                ptr::null_mut(),
+                null_mut(),
                 new_size,
                 PROT_READ | PROT_WRITE | PROT_EXEC,
                 MAP_PRIVATE | MAP_ANONYMOUS,
@@ -116,6 +116,7 @@ impl ExecMem {
             munmap(self.ptr as *mut _, self.size);
         }
     }
+    pub fn current_addr(&self) -> usize { unsafe { self.ptr.add(self.used) as usize } }
 
     pub fn as_ptr(&self) -> *const u8 {
         self.ptr
@@ -355,14 +356,8 @@ fn resolve_next_addr(
         }
         // RET: 1101011010
         if op10 == 0b1101011010 {
-            let reg_num = ((instr >> 5) & 0x1F) as usize;
-            return Some(if reg_num < 31 {
-                regs.regs[reg_num]
-            } else if reg_num == 30 { 
-                regs.regs[30] 
-            } else { 
-                regs.sp 
-            });
+            // let reg_num = ((instr >> 5) & 0x1F) as usize;
+            return Some( regs.regs[30] );
         }
 
         // 不是跳转指令
@@ -406,7 +401,7 @@ pub extern "C" fn hello_entry(){
     }
 
     // GLOBAL_STREAM.lock().unwrap().set(connect_socket().unwrap()).unwrap();
-    GLOBAL_STREAM.set(connect_socket().unwrap()).unwrap();
+    GLOBAL_STREAM.set(connect_socket().expect("wwb connect socket failed!!!")).unwrap();
     let mut stream = GLOBAL_STREAM.get().unwrap();
     
     let _ = stream.write("HELLO_AGENT".as_bytes()).unwrap();
@@ -432,7 +427,7 @@ pub extern "C" fn hello_entry(){
                                     GLOBAL_STREAM.get().unwrap().write_all(format!("error: {}", e).as_bytes()).unwrap();
                                 }
                             }
-                            unsafe { kill(process::id() as pid_t, SIGSTOP) }
+                            unsafe { kill(process::id() as pid_t, SIGSTOP ) }
                         });
                     },
                     Some("jhook") => {
@@ -585,67 +580,76 @@ fn gen_bridge_movs(reg_num: u8) -> [u32; 3] {
 static mut INSTRUCT_PTR: *const u32 = null_mut();
 static mut EXE_MEM: Lazy<Mutex<ExecMem>> = Lazy::new(|| {Mutex::new(ExecMem::new().unwrap())});
 
-fn transformer_wrapper(val:usize,xn:usize) {
+#[no_mangle]
+pub extern "C" fn transformer_wrapper_full(ctx:[usize;31],lr:usize) -> usize {
     unsafe {
         let mut vall = UserRegs::default();
-        if xn == 31 {
-            vall.pstate = val;
-        }else {
-            vall.regs[xn] = val;
-        }
+        vall.regs[..29].copy_from_slice(&ctx[..29]);
+        vall.regs[30] = lr;
+        vall.pstate = ctx[30];
+        // if xn == 31 {
+        //     vall.pstate = val;
+        // }else {
+        //     vall.regs[xn] = val;
+        // }
         let addr = resolve_next_addr(INSTRUCT_PTR, vall).unwrap();
-        let exe_mem = EXE_MEM.lock().unwrap();
+        
+        // let exe_mem = EXE_MEM.lock().unwrap();
 
         // let old_mem_used = exe_mem.used;
-        transformer_global(addr).expect("wwb panic message");
+        match transformer_global(addr) {
+            Ok(addr) => {
+                addr
+            },
+            _ => {
+                panic!("transformer failed!! please file a issue")
+            }
+        }
     }
 }
 
 pub fn transformer_global(addr: usize) -> Result<usize>{
     unsafe {
-        let mut result = Ok(0);
         let mut exe_mem = EXE_MEM.lock().unwrap();
-            
-        INSTRUCT_PTR = addr as *const u32;
+        let ret_addr = exe_mem.current_addr();
+
         if is_arm64_call(*INSTRUCT_PTR) {
             for instr in gen_mov_reg_addr(30,INSTRUCT_PTR.add(1) as usize) {
                 exe_mem.write_u32(instr)?;
             }
         }
-        let closure_result = (|| {
+
+        INSTRUCT_PTR = addr as *const u32;
+        let closure_result = {
             while !is_arm64_branch(*INSTRUCT_PTR) {
                 exe_mem.write_u32(*INSTRUCT_PTR).unwrap();
                 INSTRUCT_PTR = INSTRUCT_PTR.add(1);
             }
             Ok(())
-        })();
+        };
         match closure_result{
             Ok(_)=>{},
             Err(e)=>{
+                GLOBAL_STREAM.get().unwrap().write_all(e).unwrap();
                 exe_mem.reset();
-                if (exe_mem.size - exe_mem.used) < 4 {
-                    result = transformer_global(addr);
-                } else {
-                    result = Err(e)
-                }
+                transformer_global(addr);
             }
         }
-            
-        // 后面的代码只有在没有错误或没有递归的情况下才会执行
-        let reg_used = analyze_branch_regs(*INSTRUCT_PTR);
-        if !reg_used.read_flags {
-            for instruct in gen_bridge_movs(reg_used.read_regs){
-                exe_mem.write_u32(instruct).unwrap();
-            }
-        }else {
-            exe_mem.write_u32(0xD53B4200).unwrap();
-            exe_mem.write_u32(gen_mov_x1_imm(31)).unwrap();
-        }
+        
+        // let reg_used = analyze_branch_regs(*INSTRUCT_PTR);
+        // if !reg_used.read_flags {
+        //     for instruct in gen_bridge_movs(reg_used.read_regs){
+        //         exe_mem.write_u32(instruct).unwrap();
+        //     }
+        // }else {
+        //     exe_mem.write_u32(0xD53B4200).unwrap();
+        //     exe_mem.write_u32(gen_mov_x1_imm(31)).unwrap();
+        // }
         for instruct in gen_jump_to_transformer(){
             exe_mem.write_u32(instruct).unwrap();
         }
-        result = Ok(exe_mem.used);
-        result
+        clear_cache(exe_mem.ptr,exe_mem.ptr.add(exe_mem.size));
+        Ok(ret_addr)
     }
 }
 
@@ -685,38 +689,15 @@ fn gum_modify_thread(thread_id:usize) -> Result<pid_t> {
     // }
 }
 
-pub fn mtransform(){
-    let mut reg_buffer:[usize;30] = [0;30];
-    unsafe {
-        asm!(
-            "stp x0,x1, [lr]",
-            "stp x2,x3, [lr,16]",
-            "stp x4,x5, [lr,32]",
-            "stp x6,x7, [lr,48]",
-            "stp x8,x9, [lr,64]",
-            "stp x10,x11, [lr,80]",
-            "stp x12,x13, [lr,96]",
-            "stp x14,x15, [lr,112]",
-            "stp x16,x17, [lr,128]",
-            "stp x18,x19, [lr,144]",
-            "stp x20,x21, [lr,160]",
-            "stp x22,x23, [lr,176]",
-            "stp x24,x25, [lr,192]",
-            "stp x26,x27, [lr,208]",
-            "str x28,[lr,224]",
-            "mrs x0, NZCV",
-            "str x0,[lr,232]",
-            
-            in("lr") &mut reg_buffer as *mut _ as usize,
-        );
-    }
-
+extern "C" {
+    pub fn mtransform();
+    // pub fn clearCache(begin:*mut u8,end:*mut u8);
+    
 }
 
 extern "C" fn tracer(thread_id:i32) -> c_int {
     let mut stream = GLOBAL_STREAM.get().unwrap();
-
-    stream.write_all(("entr tracer: ".to_string() + &thread_id.to_string()).as_bytes()).expect("stream write error");
+    
     unsafe {
          match attach_to_thread(thread_id){
             Ok(_) => {
@@ -731,7 +712,8 @@ extern "C" fn tracer(thread_id:i32) -> c_int {
         
         let mut regs = get_registers(thread_id).unwrap();
         INSTRUCT_PTR = regs.pc as *const u32;
-        stream.write_all(("get pc: ".to_string() + &*(INSTRUCT_PTR as usize).to_string()).as_bytes());
+        stream.write_all(("\nget pc: ".to_string() + &*(INSTRUCT_PTR as usize).to_string()).as_bytes());
+        
         while !is_arm64_branch(*INSTRUCT_PTR) {
             exe_mem.write_u32(*INSTRUCT_PTR).unwrap();
             INSTRUCT_PTR = INSTRUCT_PTR.add(1);
@@ -750,12 +732,14 @@ extern "C" fn tracer(thread_id:i32) -> c_int {
         for instruct in gen_jump_to_transformer(){
             exe_mem.write_u32(instruct).unwrap();
         }
-        stream.write_all(("trace compile finished :".to_string()+&*(regs.pc as u64).to_string()).as_bytes());
+        stream.write_all(("\ntrace compile finished :".to_string()+&*(regs.pc as u64).to_string()).as_bytes());
         regs.pc = exe_mem.ptr as usize;
         set_reg(thread_id, &mut regs).unwrap();
         // gum_libc_ptrace(PTRACE_CONT,thread_id,0,0);
         
-        gum_libc_ptrace(PTRACE_DETACH,thread_id,0,SIGSTOP as usize);
+        // gum_libc_ptrace(PTRACE_DETACH,thread_id,0,SIGSTOP as usize);
+        gum_libc_ptrace(PTRACE_DETACH,thread_id,0,0);
+        stream.write_all("\ndone! detached!".as_bytes()).expect("stream write error");
         return 1;
         // let ret =  libc::ptrace(libc::PTRACE_CONT, thread_id, 0, 0);
         // if ret == -1 {
