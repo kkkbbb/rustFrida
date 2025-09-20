@@ -2,6 +2,7 @@
 mod jhook;
 mod gumlibc;
 mod writer;
+mod relocater;
 
 use crate::gumlibc::{gum_libc_ptrace, gum_libc_waitpid};
 use crate::jhook::jhook;
@@ -10,6 +11,7 @@ use libc::{PTRACE_ATTACH, PTRACE_GETREGSET, PTRACE_CONT};
 use nix::errno::Errno;
 use once_cell::unsync::Lazy;
 use std::ffi::c_void;
+use std::fmt::format;
 use std::io::Write;
 use std::io::{Error, Read};
 use std::mem::{size_of, zeroed};
@@ -118,6 +120,14 @@ impl ExecMem {
     }
     pub fn current_addr(&self) -> usize { unsafe { self.ptr.add(self.used) as usize } }
 
+    pub fn external_write_instruct(&mut self) -> usize {
+        unsafe {
+            let result = self.ptr.add(self.used) as usize;
+            self.used+=4;
+            result
+        }
+    }
+
     pub fn as_ptr(&self) -> *const u8 {
         self.ptr
     }
@@ -221,149 +231,238 @@ fn attach_to_thread(thread_id: i32) -> Result<()> {
 }
 
 pub fn is_arm64_branch(code: u32) -> bool {
-    let op6 = code >> 26;
+    let swapped = code.swap_bytes();
+    let op6 = swapped >> 26;
     if op6 == 0b000101 || op6 == 0b100101 {
         // B, BL
         return true;
     }
-    let op8 = code >> 24;
+    let op8 = swapped >> 24;
     if op8 == 0b01010100 {
         // B.cond
         return true;
     }
-    let op10 = code >> 21;
-    if op10 == 0b1101011000 {
+    let op10 = swapped >> 22;
+    if op10 == 0b1101011000 || op10 == 0b1101011001 || op10 == 0b1101011010 {
         // BR, BLR, RET
         return true;
     }
     // CBZ/CBNZ
-    if (code & 0x7F000000) == 0x34000000 || (code & 0x7F000000) == 0x35000000 {
+    if (swapped & 0x7F000000) == 0x34000000 || (swapped & 0x7F000000) == 0x35000000 {
         return true;
     }
     // TBZ/TBNZ
-    if ((code & 0xFF000000) == 0x36000000 || (code & 0xFF000000) == 0x37000000) {
+    if ((swapped & 0xFF000000) == 0x36000000 || (swapped & 0xFF000000) == 0x37000000) {
         return true;
     }
     false
 }
 
 pub fn is_arm64_call(instr: u32) -> bool {
+    let swapped = instr.swap_bytes();
     // BL: 高6位 0b100101
-    if (instr >> 26) == 0b100101 {
+    if (swapped >> 26) == 0b100101 {
         return true;
     }
     // BLR: 高10位 0b11010110001
-    if (instr >> 21) == 0b11010110001 {
+    if (swapped >> 21) == 0b11010110001 {
         return true;
     }
     false
 }
 
+/// ARM64 分支指令类型
+#[derive(Debug, Clone, Copy)]
+enum Arm64BranchType {
+    UnconditionalBranch { target: usize },        // B, BL
+    ConditionalBranch { taken: usize, not_taken: usize }, // B.cond
+    CompareBranch { taken: usize, not_taken: usize },     // CBZ, CBNZ
+    TestBitBranch { taken: usize, not_taken: usize },     // TBZ, TBNZ
+    IndirectBranch { target: usize },             // BR, BLR, RET
+}
+
+/// ARM64 指令 opcodes 常量
+mod arm64_opcodes {
+    // Unconditional branch
+    pub const B_OPCODE: u32 = 0b000101;
+    pub const BL_OPCODE: u32 = 0b100101;
+    
+    // Conditional branch
+    pub const B_COND_MASK: u32 = 0xFF00_0000;
+    pub const B_COND_VALUE: u32 = 0x5400_0000;
+    
+    // Compare and branch
+    pub const CBZ_CBNZ_MASK: u32 = 0x7F00_0000;
+    pub const CBZ_VALUE: u32 = 0x3400_0000;
+    pub const CBNZ_VALUE: u32 = 0x3500_0000;
+    
+    // Test bit and branch
+    pub const TBZ_VALUE: u32 = 0x3600_0000;
+    pub const TBNZ_VALUE: u32 = 0x3700_0000;
+    
+    // Indirect branch
+    pub const BR_OPCODE: u32 = 0b1101011000;
+    pub const BLR_OPCODE: u32 = 0b1101011001;
+    pub const RET_OPCODE: u32 = 0b1101011010;
+}
+
 /// 返回即将执行的下一条指令地址（已判断条件）
-fn resolve_next_addr(
+#[inline]
+fn sign_extend(value: u64, bits: u8) -> i64 {
+    // 对低 bits 位进行符号扩展（2's complement）
+    let shift = 64 - bits as u64;
+    ((value << shift) as i64) >> shift
+}
+
+/// 解析无条件分支指令 (B, BL)
+fn parse_unconditional_branch(instr: u32, pc: usize) -> Option<Arm64BranchType> {
+    use arm64_opcodes::*;
+    
+    let op6 = (instr >> 26) & 0x3F;
+    if op6 == B_OPCODE || op6 == BL_OPCODE {
+        let imm26 = (instr & 0x03FF_FFFF) as u64;
+        let offset = (sign_extend(imm26, 26) << 2) as isize;
+        let target = (pc as isize).wrapping_add(offset) as usize;
+        return Some(Arm64BranchType::UnconditionalBranch { target });
+    }
+    None
+}
+
+/// 解析条件分支指令 (B.cond)
+fn parse_conditional_branch(instr: u32, pc: usize, regs: &UserRegs) -> Option<Arm64BranchType> {
+    use arm64_opcodes::*;
+    
+    if (instr & B_COND_MASK) == B_COND_VALUE {
+        let imm19 = ((instr >> 5) & 0x7FFFF) as u64;
+        let offset = (sign_extend(imm19, 19) << 2) as isize;
+        let branch_target = (pc as isize).wrapping_add(offset) as usize;
+        let next_target = pc;
+        
+        return Some(Arm64BranchType::ConditionalBranch {
+            taken: branch_target,
+            not_taken: next_target,
+        });
+    }
+    None
+}
+
+/// 解析比较分支指令 (CBZ, CBNZ)
+fn parse_compare_branch(instr: u32, pc: usize, regs: &UserRegs) -> Option<Arm64BranchType> {
+    use arm64_opcodes::*;
+    
+    let top7 = instr & CBZ_CBNZ_MASK;
+    if top7 == CBZ_VALUE || top7 == CBNZ_VALUE {
+        let rt = (instr & 0x1F) as usize;
+        let imm19 = ((instr >> 5) & 0x7FFFF) as u64;
+        let offset = (sign_extend(imm19, 19) << 2) as isize;
+        let branch_target = (pc as isize).wrapping_add(offset) as usize;
+        let next_target = pc;
+        
+        return Some(Arm64BranchType::CompareBranch {
+            taken: branch_target,
+            not_taken: next_target,
+        });
+    }
+    None
+}
+
+/// 解析测试位分支指令 (TBZ, TBNZ)
+fn parse_test_bit_branch(instr: u32, pc: usize, regs: &UserRegs) -> Option<Arm64BranchType> {
+    use arm64_opcodes::*;
+    
+    let top7 = instr & CBZ_CBNZ_MASK; // Same mask as CBZ/CBNZ
+    if top7 == TBZ_VALUE || top7 == TBNZ_VALUE {
+        let rt = (instr & 0x1F) as usize;
+        let imm14 = ((instr >> 5) & 0x3FFF) as u64;
+        let offset = (sign_extend(imm14, 14) << 2) as isize;
+        let branch_target = (pc as isize).wrapping_add(offset) as usize;
+        let next_target = pc;
+        
+        return Some(Arm64BranchType::TestBitBranch {
+            taken: branch_target,
+            not_taken: next_target,
+        });
+    }
+    None
+}
+
+/// 解析间接分支指令 (BR, BLR, RET)
+fn parse_indirect_branch(instr: u32, regs: &UserRegs) -> Option<Arm64BranchType> {
+    use arm64_opcodes::*;
+    
+    let op10 = (instr >> 21) & 0x3FF;
+    match op10 {
+        BR_OPCODE | BLR_OPCODE => {
+            let rn = ((instr >> 5) & 0x1F) as usize;
+            let target = if rn < 31 { regs.regs[rn] } else { regs.sp };
+            Some(Arm64BranchType::IndirectBranch { target })
+        }
+        RET_OPCODE => {
+            let rn = ((instr >> 5) & 0x1F) as usize;
+            let target = if rn == 31 { regs.regs[30] } else { regs.regs[rn] };
+            Some(Arm64BranchType::IndirectBranch { target })
+        }
+        _ => None
+    }
+}
+
+/// 根据分支类型和寄存器状态决定下一条指令地址
+fn resolve_branch_target(branch_type: Arm64BranchType, instr: u32, regs: &UserRegs) -> usize {
+    match branch_type {
+        Arm64BranchType::UnconditionalBranch { target } => target,
+        Arm64BranchType::IndirectBranch { target } => target,
+        
+        Arm64BranchType::ConditionalBranch { taken, not_taken } => {
+            let cond = (instr & 0xF) as u8;
+            if arm64_cond_pass(cond, regs.pstate) { taken } else { not_taken }
+        }
+        
+        Arm64BranchType::CompareBranch { taken, not_taken } => {
+            let rt = (instr & 0x1F) as usize;
+            let val = regs.regs[rt];
+            let is_cbz = (instr & arm64_opcodes::CBZ_CBNZ_MASK) == arm64_opcodes::CBZ_VALUE;
+            let zero = val == 0;
+            if (is_cbz && zero) || (!is_cbz && !zero) { taken } else { not_taken }
+        }
+        
+        Arm64BranchType::TestBitBranch { taken, not_taken } => {
+            let rt = (instr & 0x1F) as usize;
+            let b5 = ((instr >> 31) & 0x1) as u32;
+            let b4_0 = ((instr >> 19) & 0x1F) as u32;
+            let bit_ix = (b5 << 5) | b4_0;
+            
+            let val = regs.regs[rt] as u64;
+            let bit_set = ((val >> bit_ix) & 1) != 0;
+            let is_tbz = (instr & arm64_opcodes::CBZ_CBNZ_MASK) == arm64_opcodes::TBZ_VALUE;
+            if (is_tbz && !bit_set) || (!is_tbz && bit_set) { taken } else { not_taken }
+        }
+    }
+}
+
+pub unsafe fn resolve_next_addr(
     instr_ptr: *const u32,
     regs: UserRegs,
 ) -> Option<usize> {
-    unsafe {
-        let instr = *instr_ptr;
-        let instr_addr = instr_ptr;
-        let pstate = regs.pstate;
+    use core::ptr;
 
-        // 1. 无条件跳转 (B, BL)
-        let op6 = instr >> 26;
-        if op6 == 0b000101 || op6 == 0b100101 {
-            let offset = ((instr & 0x03FFFFFF) << 2) as i32;
-            let offset = if (offset & 0x02000000) != 0 {
-                (offset as u32 | 0xFC000000u32) as isize
-            } else {
-                offset as isize
-            };
-            return Some(instr_addr.offset(offset) as usize);
-        }
+    // 读取并转换指令字节序
+    let instr = ptr::read_volatile(instr_ptr).swap_bytes();
+    let _ = GLOBAL_STREAM.get().unwrap().write_all(format!("instruct: {:x}", instr).as_bytes());
 
-        // 2. 条件跳转 (B.cond)
-        if (instr >> 24) == 0b01010100 {
-            let cond = (instr & 0xF) as u8;
-            let offset = (((instr >> 5) & 0x7FFFF) << 2) as isize;
-            let offset = if (offset & 0x00100000) != 0 {
-                (offset as u32 | 0xFFE00000u32) as isize
-            } else {
-                offset
-            };
-            let branch_addr = instr_addr.offset(offset);
-            let next_addr = instr_addr.offset(4);
-            if arm64_cond_pass(cond, pstate) {
-                return Some(branch_addr as usize);
-            } else {
-                return Some(next_addr as usize);
-            }
-        }
+    // 计算PC值 (当前指令地址 + 4)
+    let pc = (instr_ptr as usize).wrapping_add(4);
 
-        // 3. CBZ/CBNZ
-        if ((instr >> 25) & 0x3F) == 0b011010 || ((instr >> 25) & 0x3F) == 0b011011 {
-            let is_cbz = ((instr >> 24) & 1) == 0;
-            let reg = ((instr >> 0) & 0x1F) as usize;
-            let offset = (((instr >> 5) & 0x7FFFF) << 2) as i32;
-            let offset = if (offset & 0x00100000) != 0 {
-                (offset as u32 | 0xFFE00000u32) as isize
-            } else {
-                offset as isize
-            };
-            let branch_addr = instr_addr.offset(offset);
-            let next_addr = instr_addr.offset(4);
-            let reg_val = regs.regs[reg];
-            let is_zero = reg_val == 0;
-            if (is_cbz && is_zero) || (!is_cbz && !is_zero) {
-                return Some(branch_addr as usize);
-            } else {
-                return Some(next_addr as usize);
-            }
-        }
+    // 尝试解析各种分支指令类型
+    let branch_type = parse_unconditional_branch(instr, pc)
+        .or_else(|| parse_conditional_branch(instr, pc, &regs))
+        .or_else(|| parse_compare_branch(instr, pc, &regs))
+        .or_else(|| parse_test_bit_branch(instr, pc, &regs))
+        .or_else(|| parse_indirect_branch(instr, &regs))?;
 
-        // 4. TBZ/TBNZ
-        if ((instr >> 25) & 0x3E) == 0b011110 {
-            let is_tbz = ((instr >> 24) & 1) == 0;
-            let reg = ((instr >> 0) & 0x1F) as usize;
-            let bit = ((instr >> 19) & 0x1F) as u8 | (((instr >> 31) & 1) << 5) as u8;
-            let offset = (((instr >> 5) & 0x3FFF) << 2) as i32;
-            let offset = if (offset & 0x00008000) != 0 {
-                (offset as u32 | 0xFFFF0000u32) as isize
-            } else {
-                offset as isize
-            };
-            let branch_addr = instr_addr.offset(offset);
-            let next_addr = instr_addr.offset(4);
-            let reg_val = regs.regs[reg];
-            let bit_set = ((reg_val >> bit) & 1) != 0;
-            if (is_tbz && !bit_set) || (!is_tbz && bit_set) {
-                return Some(branch_addr as usize);
-            } else {
-                return Some(next_addr as usize);
-            }
-        }
-
-        // 5. 间接跳转 (BR/BLR/RET)
-        let op10 = instr >> 21;
-        // BR: 1101011000
-        if op10 == 0b1101011000 {
-            let reg_num = ((instr >> 5) & 0x1F) as usize;
-            return Some(if reg_num < 31 { regs.regs[reg_num] } else { regs.sp });
-        }
-        // BLR: 1101011001
-        if op10 == 0b1101011001 {
-            let reg_num = ((instr >> 5) & 0x1F) as usize;
-            return Some(if reg_num < 31 { regs.regs[reg_num] } else { regs.sp });
-        }
-        // RET: 1101011010
-        if op10 == 0b1101011010 {
-            // let reg_num = ((instr >> 5) & 0x1F) as usize;
-            return Some( regs.regs[30] );
-        }
-
-        // 不是跳转指令
-        None
-    }
+    // 根据分支类型和寄存器状态确定目标地址
+    Some(resolve_branch_target(branch_type, instr, &regs))
 }
+
 
 /// 判断 ARM64 条件码是否成立
 fn arm64_cond_pass(cond: u8, pstate: usize) -> bool {
@@ -487,12 +586,13 @@ pub fn gen_mov_reg_addr(reg: u8, imm: usize) -> Vec<u32> {
 }
 
 pub fn gen_jump_to_transformer() -> Vec<u32> {
-    
+    let mut instruct = Vec::new();
+    instruct.push(0xA9BF7BFD); //stp x29, x30, [sp, #-0x10]!
     // 1. 加载地址到 X30
-    let mut instruct = gen_mov_reg_addr(30,mtransform as usize);
-    
+    instruct.append(&mut gen_mov_reg_addr(30, mtransform as usize));
     // 2. BR X30
     instruct.push(0xD61F03C0);
+    instruct.push(0xA8C17BFD); // ldp x29, x30, [sp], #0x10
     instruct
 }
 
@@ -509,10 +609,11 @@ pub struct BranchRegUsage {
 /// 分析一条跳转指令涉及的寄存器
 pub fn analyze_branch_regs(instr: u32) -> BranchRegUsage {
     let mut usage = BranchRegUsage::default();
+    let swapped = instr.swap_bytes();
 
-    let op6 = instr >> 26;
-    let op8 = instr >> 24;
-    let op10 = instr >> 21;
+    let op6 = swapped >> 26;
+    let op8 = swapped >> 24;
+    let op10 = swapped >> 21;
 
     // 1. B, BL（无条件跳转/带链接）
     if op6 == 0b000101 {
@@ -526,28 +627,28 @@ pub fn analyze_branch_regs(instr: u32) -> BranchRegUsage {
         usage.read_flags = true;
     }
     // 3. CBZ/CBNZ（比较寄存器是否为0）
-    else if ((instr >> 25) & 0x3F) == 0b011010 || ((instr >> 25) & 0x3F) == 0b011011 {
-        let reg = (instr & 0x1F) as u8;
+    else if ((swapped >> 25) & 0x3F) == 0b011010 || ((swapped >> 25) & 0x3F) == 0b011011 {
+        let reg = (swapped & 0x1F) as u8;
         usage.read_regs = reg;
     }
     // 4. TBZ/TBNZ（测试寄存器某一位）
-    else if ((instr >> 25) & 0x3E) == 0b011110 {
-        let reg = (instr & 0x1F) as u8;
+    else if ((swapped >> 25) & 0x3E) == 0b011010 || ((swapped >> 25) & 0x3E) == 0b011110 {
+        let reg = (swapped & 0x1F) as u8;
         usage.read_regs = reg;
     }
     // 5. BR/BLR/RET（间接跳转）
     else if op10 == 0b1101011000 {
         // BR
-        let reg = ((instr >> 5) & 0x1F) as u8;
+        let reg = ((swapped >> 5) & 0x1F) as u8;
         usage.read_regs = reg;
     } else if op10 == 0b1101011001 {
         // BLR
-        let reg = ((instr >> 5) & 0x1F) as u8;
+        let reg = ((swapped >> 5) & 0x1F) as u8;
         usage.read_regs = reg;
         // usage.write_regs.push(30); // X30 (LR)
     } else if op10 == 0b1101011010 {
         // RET
-        let reg = ((instr >> 5) & 0x1F) as u8;
+        let reg = ((swapped >> 5) & 0x1F) as u8;
         usage.read_regs = reg;
     }
 
@@ -581,12 +682,15 @@ static mut INSTRUCT_PTR: *const u32 = null_mut();
 static mut EXE_MEM: Lazy<Mutex<ExecMem>> = Lazy::new(|| {Mutex::new(ExecMem::new().unwrap())});
 
 #[no_mangle]
-pub extern "C" fn transformer_wrapper_full(ctx:[usize;31],lr:usize) -> usize {
+pub extern "C" fn transformer_wrapper_full(ctx:[usize;32]) -> usize {
     unsafe {
         let mut vall = UserRegs::default();
-        vall.regs[..29].copy_from_slice(&ctx[..29]);
-        vall.regs[30] = lr;
-        vall.pstate = ctx[30];
+        let mut log = String::from("context: \n");
+        for i in 0..31 {
+            vall.regs[i] = ctx[31 - i]; // 反序拷贝
+            log.push_str(&format!("regs[{}] = {:x}\n", i, ctx[31 - i]));
+        }
+        vall.pstate = ctx[0];
         // if xn == 31 {
         //     vall.pstate = val;
         // }else {
@@ -622,7 +726,8 @@ pub fn transformer_global(addr: usize) -> Result<usize>{
         INSTRUCT_PTR = addr as *const u32;
         let closure_result = {
             while !is_arm64_branch(*INSTRUCT_PTR) {
-                exe_mem.write_u32(*INSTRUCT_PTR).unwrap();
+                // exe_mem.write_u32(*INSTRUCT_PTR).unwrap();
+                relocater::relocate_one_a64(INSTRUCT_PTR as usize ,exe_mem.external_write_instruct());
                 INSTRUCT_PTR = INSTRUCT_PTR.add(1);
             }
             Ok(())
@@ -715,7 +820,8 @@ extern "C" fn tracer(thread_id:i32) -> c_int {
         stream.write_all(("\nget pc: ".to_string() + &*(INSTRUCT_PTR as usize).to_string()).as_bytes());
         
         while !is_arm64_branch(*INSTRUCT_PTR) {
-            exe_mem.write_u32(*INSTRUCT_PTR).unwrap();
+            // exe_mem.write_u32(*INSTRUCT_PTR).unwrap();
+            relocater::relocate_one_a64(INSTRUCT_PTR as usize ,exe_mem.external_write_instruct());
             INSTRUCT_PTR = INSTRUCT_PTR.add(1);
         }
         
@@ -740,13 +846,12 @@ extern "C" fn tracer(thread_id:i32) -> c_int {
         // gum_libc_ptrace(PTRACE_DETACH,thread_id,0,SIGSTOP as usize);
         gum_libc_ptrace(PTRACE_DETACH,thread_id,0,0);
         stream.write_all("\ndone! detached!".as_bytes()).expect("stream write error");
-        return 1;
+        1
         // let ret =  libc::ptrace(libc::PTRACE_CONT, thread_id, 0, 0);
         // if ret == -1 {
         //     panic!("ptrace_cont: {}", Error::last_os_error())
         // }
         
     }
-    1
     
 }
