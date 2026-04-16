@@ -1,8 +1,9 @@
+use crate::data::TraceBundleMetadata;
 use crossbeam_channel::Sender;
 use lazy_static::lazy_static;
-use qbdi::{VM, VirtualStack};
+use qbdi::{VirtualStack, VM};
 use std::collections::HashMap;
-use std::ffi::c_char;
+use std::ffi::{c_char, CStr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
@@ -10,11 +11,9 @@ use std::thread::JoinHandle;
 pub(crate) const TRACE_BUNDLE_MAGIC: &[u8; 4] = b"TRB1";
 pub(crate) const DYNAMIC_EXEC_CHUNK_SIZE: usize = 1024 * 1024;
 pub(crate) const TRACE_MAX_PENDING_BYTES: usize = 1024 * 1024 * 1024;
-pub(crate) const TRACE_MAX_INSTRUCTIONS: u64 = 5_000;
 pub(crate) const TRACE_PROGRESS_EVERY: u64 = 1_000;
 pub(crate) const TRACE_CHUNK_SIZE: usize = 1024 * 1024;
 pub(crate) const TRACE_SHARDS: usize = 4;
-pub(crate) const TRACE_STACK_SIZE: u32 = 0x100000;
 
 #[derive(Clone, Debug)]
 pub(crate) struct ExecMap {
@@ -52,24 +51,15 @@ unsafe impl Send for ManagedVm {}
 
 impl TraceQueueBudget {
     pub(crate) fn reserve(&self, bytes: usize) {
-        let mut pending = self
-            .pending_bytes
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut pending = self.pending_bytes.lock().unwrap_or_else(|e| e.into_inner());
         while *pending != 0 && pending.saturating_add(bytes) > TRACE_MAX_PENDING_BYTES {
-            pending = self
-                .condvar
-                .wait(pending)
-                .unwrap_or_else(|e| e.into_inner());
+            pending = self.condvar.wait(pending).unwrap_or_else(|e| e.into_inner());
         }
         *pending = pending.saturating_add(bytes);
     }
 
     pub(crate) fn release(&self, bytes: usize) {
-        let mut pending = self
-            .pending_bytes
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut pending = self.pending_bytes.lock().unwrap_or_else(|e| e.into_inner());
         *pending = pending.saturating_sub(bytes);
         self.condvar.notify_all();
     }
@@ -77,6 +67,7 @@ impl TraceQueueBudget {
 
 pub(crate) static TRACE_OUTPUT_DIR: OnceLock<String> = OnceLock::new();
 pub(crate) static LAST_ERROR: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+pub(crate) static TRACE_BUNDLE_METADATA: Mutex<Option<TraceBundleMetadata>> = Mutex::new(None);
 pub(crate) static TRACE_WRITER: Mutex<Option<TraceWriter>> = Mutex::new(None);
 pub(crate) static TRACE_FINALIZERS: Mutex<Vec<JoinHandle<()>>> = Mutex::new(Vec::new());
 pub(crate) static TRACE_NEXT_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -110,6 +101,9 @@ lazy_static! {
     pub(crate) static ref ADDED_DYNAMIC_RANGES: Mutex<std::collections::HashSet<(u64, u64)>> =
         Mutex::new(std::collections::HashSet::new());
     pub(crate) static ref DUMPED_DYNAMIC_RANGES: Mutex<std::collections::HashSet<(u64, u64)>> =
+        Mutex::new(std::collections::HashSet::new());
+    /// 已添加到 instrumented range 的模块路径集合 (避免重复添加)
+    pub(crate) static ref ADDED_MODULES: Mutex<std::collections::HashSet<String>> =
         Mutex::new(std::collections::HashSet::new());
 }
 
@@ -189,6 +183,39 @@ pub(crate) fn set_trace_output_dir(path: &str) {
     let _ = TRACE_OUTPUT_DIR.set(path.to_string());
 }
 
+pub(crate) fn set_trace_bundle_metadata(module_path: String, module_base: u64) {
+    *TRACE_BUNDLE_METADATA.lock().unwrap_or_else(|e| e.into_inner()) = Some(TraceBundleMetadata {
+        module_path,
+        module_base,
+    });
+}
+
+pub(crate) fn get_trace_bundle_metadata() -> Option<TraceBundleMetadata> {
+    TRACE_BUNDLE_METADATA.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+#[no_mangle]
+pub extern "C" fn qbdi_trace_set_bundle_metadata(module_path: *const c_char, module_base: u64) -> i32 {
+    clear_last_error();
+    if module_path.is_null() {
+        set_last_error("module_path is null");
+        return -1;
+    }
+    let module_path = match unsafe { CStr::from_ptr(module_path) }.to_str() {
+        Ok(path) if !path.is_empty() => path,
+        Ok(_) => {
+            set_last_error("empty module_path");
+            return -1;
+        }
+        Err(_) => {
+            set_last_error("invalid module_path");
+            return -1;
+        }
+    };
+    set_trace_bundle_metadata(module_path.to_string(), module_base);
+    0
+}
+
 pub(crate) fn helper_log(msg: &str) {
     unsafe {
         extern "C" {
@@ -197,15 +224,11 @@ pub(crate) fn helper_log(msg: &str) {
         let tag = b"rustFrida\0";
         let mut buf = msg.as_bytes().to_vec();
         buf.push(0);
-        let _ =
-            __android_log_write(4, tag.as_ptr() as *const c_char, buf.as_ptr() as *const c_char);
+        let _ = __android_log_write(4, tag.as_ptr() as *const c_char, buf.as_ptr() as *const c_char);
     }
 }
 
-pub(crate) fn with_vm<R>(
-    handle: u64,
-    f: impl FnOnce(&mut ManagedVm) -> Result<R, String>,
-) -> Result<R, String> {
+pub(crate) fn with_vm<R>(handle: u64, f: impl FnOnce(&mut ManagedVm) -> Result<R, String>) -> Result<R, String> {
     let mut registry = VM_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
     let managed = registry
         .get_mut(&handle)

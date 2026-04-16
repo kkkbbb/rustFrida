@@ -29,9 +29,7 @@ pub(super) fn is_readable(addr: u64, len: usize) -> bool {
     let end = addr + len as u64;
     MEM_REGIONS.with(|r| {
         let regions = r.borrow();
-        regions
-            .iter()
-            .any(|reg| addr >= reg.start && end <= reg.end)
+        regions.iter().any(|reg| addr >= reg.start && end <= reg.end)
     })
 }
 

@@ -1,8 +1,7 @@
 //! QBDI Virtual Machine wrapper
 
 use crate::callback::{
-    AnalysisType, CallbackId, InstAnalysis, InstPosition, MemoryAccess, MemoryAccessType,
-    INVALID_EVENTID,
+    AnalysisType, CallbackId, InstAnalysis, InstPosition, MemoryAccess, MemoryAccessType, INVALID_EVENTID,
 };
 use crate::ffi::{self, VMInstanceRef};
 use crate::state::{FPRState, GPRState, RWord};
@@ -73,9 +72,7 @@ impl VM {
             ptrs
         });
 
-        let mattrs_ptr = mattrs_ptrs
-            .as_mut()
-            .map_or(ptr::null_mut(), |v| v.as_mut_ptr());
+        let mattrs_ptr = mattrs_ptrs.as_mut().map_or(ptr::null_mut(), |v| v.as_mut_ptr());
 
         unsafe {
             ffi::qbdi_initVM(&mut instance, cpu_ptr, mattrs_ptr, options.bits());
@@ -160,11 +157,7 @@ impl VM {
                 &mut retval,
                 function,
                 args.len() as u32,
-                if args.is_empty() {
-                    ptr::null()
-                } else {
-                    args.as_ptr()
-                },
+                if args.is_empty() { ptr::null() } else { args.as_ptr() },
             )
         };
 
@@ -176,12 +169,7 @@ impl VM {
     }
 
     /// Call a function with a new stack
-    pub fn switch_stack_and_call(
-        &self,
-        function: RWord,
-        stack_size: u32,
-        args: &[RWord],
-    ) -> Option<RWord> {
+    pub fn switch_stack_and_call(&self, function: RWord, stack_size: u32, args: &[RWord]) -> Option<RWord> {
         let mut retval: RWord = 0;
         let success = unsafe {
             ffi::qbdi_switchStackAndCallA(
@@ -190,11 +178,7 @@ impl VM {
                 function,
                 stack_size,
                 args.len() as u32,
-                if args.is_empty() {
-                    ptr::null()
-                } else {
-                    args.as_ptr()
-                },
+                if args.is_empty() { ptr::null() } else { args.as_ptr() },
             )
         };
 
@@ -292,9 +276,7 @@ impl VM {
         data: *mut c_void,
         priority: i32,
     ) -> CallbackId {
-        unsafe {
-            ffi::qbdi_addCodeAddrCB(self.instance, address, position, callback, data, priority)
-        }
+        unsafe { ffi::qbdi_addCodeAddrCB(self.instance, address, position, callback, data, priority) }
     }
 
     /// Add a callback for an address range
@@ -307,17 +289,7 @@ impl VM {
         data: *mut c_void,
         priority: i32,
     ) -> CallbackId {
-        unsafe {
-            ffi::qbdi_addCodeRangeCB(
-                self.instance,
-                start,
-                end,
-                position,
-                callback,
-                data,
-                priority,
-            )
-        }
+        unsafe { ffi::qbdi_addCodeRangeCB(self.instance, start, end, position, callback, data, priority) }
     }
 
     /// Add a callback for instructions matching a mnemonic
@@ -385,12 +357,7 @@ impl VM {
     // ========================================================================
 
     /// Add a callback for VM events
-    pub fn add_vm_event_cb(
-        &self,
-        events: u32,
-        callback: ffi::VMCallback,
-        data: *mut c_void,
-    ) -> CallbackId {
+    pub fn add_vm_event_cb(&self, events: u32, callback: ffi::VMCallback, data: *mut c_void) -> CallbackId {
         unsafe { ffi::qbdi_addVMEventCB(self.instance, events, callback, data) }
     }
 
@@ -417,16 +384,7 @@ impl VM {
         analysis_type: AnalysisType,
         data: *mut c_void,
     ) -> CallbackId {
-        unsafe {
-            ffi::qbdi_addInstrRuleRange(
-                self.instance,
-                start,
-                end,
-                callback,
-                analysis_type as u32,
-                data,
-            )
-        }
+        unsafe { ffi::qbdi_addInstrRuleRange(self.instance, start, end, callback, analysis_type as u32, data) }
     }
 
     // ========================================================================
@@ -463,14 +421,8 @@ impl VM {
     }
 
     /// Get analysis of a cached instruction
-    pub fn get_cached_inst_analysis(
-        &self,
-        address: RWord,
-        analysis_type: AnalysisType,
-    ) -> Option<InstAnalysis<'_>> {
-        let raw = unsafe {
-            ffi::qbdi_getCachedInstAnalysis(self.instance, address, analysis_type as u32)
-        };
+    pub fn get_cached_inst_analysis(&self, address: RWord, analysis_type: AnalysisType) -> Option<InstAnalysis<'_>> {
+        let raw = unsafe { ffi::qbdi_getCachedInstAnalysis(self.instance, address, analysis_type as u32) };
         if raw.is_null() {
             None
         } else {
@@ -479,13 +431,8 @@ impl VM {
     }
 
     /// Get analysis of a JIT instruction
-    pub fn get_jit_inst_analysis(
-        &self,
-        address: RWord,
-        analysis_type: AnalysisType,
-    ) -> Option<InstAnalysis<'_>> {
-        let raw =
-            unsafe { ffi::qbdi_getJITInstAnalysis(self.instance, address, analysis_type as u32) };
+    pub fn get_jit_inst_analysis(&self, address: RWord, analysis_type: AnalysisType) -> Option<InstAnalysis<'_>> {
+        let raw = unsafe { ffi::qbdi_getJITInstAnalysis(self.instance, address, analysis_type as u32) };
         if raw.is_null() {
             None
         } else {
@@ -651,9 +598,7 @@ impl Deref for VMRef<'_> {
 
 impl std::fmt::Debug for VMRef<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("VMRef")
-            .field("instance", &self.as_ptr())
-            .finish()
+        f.debug_struct("VMRef").field("instance", &self.as_ptr()).finish()
     }
 }
 

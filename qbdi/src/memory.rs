@@ -195,8 +195,7 @@ impl VirtualStack {
     /// Allocate a virtual stack and setup GPRState
     pub fn new(gpr_state: *mut GPRState, stack_size: u32) -> Option<Self> {
         let mut stack_ptr: *mut u8 = ptr::null_mut();
-        let success =
-            unsafe { ffi::qbdi_allocateVirtualStack(gpr_state, stack_size, &mut stack_ptr) };
+        let success = unsafe { ffi::qbdi_allocateVirtualStack(gpr_state, stack_size, &mut stack_ptr) };
 
         if success && !stack_ptr.is_null() {
             // The stack is allocated internally by QBDI
@@ -225,11 +224,7 @@ pub fn simulate_call(gpr_state: &mut GPRState, return_address: RWord, args: &[RW
             gpr_state,
             return_address,
             args.len() as u32,
-            if args.is_empty() {
-                ptr::null()
-            } else {
-                args.as_ptr()
-            },
+            if args.is_empty() { ptr::null() } else { args.as_ptr() },
         );
     }
 }
@@ -243,9 +238,7 @@ pub fn find_module(name: &str) -> Option<MemoryMap> {
 
 /// Find a module by address
 pub fn find_module_by_addr(addr: RWord) -> Option<MemoryMap> {
-    get_current_process_maps(true)
-        .into_iter()
-        .find(|m| m.contains(addr))
+    get_current_process_maps(true).into_iter().find(|m| m.contains(addr))
 }
 
 /// Get executable ranges of a module

@@ -457,6 +457,9 @@ void arm64_writer_put_branch_address_reg(Arm64Writer* w, uint64_t target, Arm64R
 /* Generate absolute call using MOVZ/MOVK sequence + BLR with specified scratch register */
 void arm64_writer_put_call_address_reg(Arm64Writer* w, uint64_t target, Arm64Reg scratch);
 
+/* ADRP+ADD+BR: 12-byte PC-relative jump (pure ALU, wxshadow safe, ±4GB range) */
+void arm64_writer_put_adrp_add_br(Arm64Writer* w, Arm64Reg scratch, uint64_t target);
+
 /* ============================================================================
  * FP/SIMD Pair Instructions
  * ============================================================================ */

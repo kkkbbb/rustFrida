@@ -60,7 +60,7 @@ pub(super) fn probe_instrumentation_spec() -> Option<InstrumentationSpec> {
     let sym =
         unsafe { crate::jsapi::module::libart_dlsym("_ZN3art7Runtime19DeoptimizeBootImageEv") };
     if sym.is_null() {
-        output_message("[instrumentation] DeoptimizeBootImage 符号未找到");
+        output_verbose("[instrumentation] DeoptimizeBootImage 符号未找到");
         return None;
     }
 
@@ -69,7 +69,7 @@ pub(super) fn probe_instrumentation_spec() -> Option<InstrumentationSpec> {
     let is_pointer_mode = apex_version >= 360_000_000;
     let deopt_offset = get_deoptimization_enabled_offset();
 
-    output_message(&format!(
+    output_verbose(&format!(
         "[instrumentation] DeoptimizeBootImage={:#x}, APEX={}, 模式={}",
         sym as u64,
         apex_version,
@@ -99,7 +99,7 @@ pub(super) fn probe_instrumentation_spec() -> Option<InstrumentationSpec> {
                 }
 
                 if offset >= 0x100 && offset <= 0x400 {
-                    output_message(&format!(
+                    output_verbose(&format!(
                         "[instrumentation] 指针模式: LDR x{}, [x{}, #{}]",
                         rt, rn, offset
                     ));
@@ -130,7 +130,7 @@ pub(super) fn probe_instrumentation_spec() -> Option<InstrumentationSpec> {
                 }
 
                 if offset >= 0x100 && offset <= 0x400 {
-                    output_message(&format!(
+                    output_verbose(&format!(
                         "[instrumentation] 嵌入模式: ADD x{}, x{}, #{}",
                         rd, rn, offset
                     ));
@@ -145,6 +145,6 @@ pub(super) fn probe_instrumentation_spec() -> Option<InstrumentationSpec> {
         }
     }
 
-    output_message("[instrumentation] 未找到 Instrumentation 偏移");
+    output_verbose("[instrumentation] 未找到 Instrumentation 偏移");
     None
 }

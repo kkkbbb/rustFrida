@@ -47,9 +47,7 @@ impl<'a> CpuContext<'a> {
 
     /// Set a numbered argument in the processor context, determined by the platform calling convention.
     pub fn set_arg(&mut self, n: u32, value: usize) {
-        unsafe {
-            gum_sys::gum_cpu_context_replace_nth_argument(self.cpu_context, n, value as *mut c_void)
-        }
+        unsafe { gum_sys::gum_cpu_context_replace_nth_argument(self.cpu_context, n, value as *mut c_void) }
     }
 
     /// Get the value of the register used for the platform calling convention's return value.
@@ -59,15 +57,11 @@ impl<'a> CpuContext<'a> {
 
     /// Set the value of the register used for the platform calling convention's return value.
     pub fn set_return_value(&mut self, value: usize) {
-        unsafe {
-            gum_sys::gum_cpu_context_replace_return_value(self.cpu_context, value as *mut c_void)
-        }
+        unsafe { gum_sys::gum_cpu_context_replace_return_value(self.cpu_context, value as *mut c_void) }
     }
 
     #[cfg(target_arch = "x86_64")]
-    cpu_accesors!(
-        u64, rip, r15, r14, r13, r12, r11, r10, r9, r8, rdi, rsi, rbp, rsp, rbx, rdx, rcx, rax
-    );
+    cpu_accesors!(u64, rip, r15, r14, r13, r12, r11, r10, r9, r8, rdi, rsi, rbp, rsp, rbx, rdx, rcx, rax);
 
     #[cfg(target_arch = "x86")]
     cpu_accesors!(u32, eip, edi, esi, ebp, esp, ebx, edx, ecx, eax);

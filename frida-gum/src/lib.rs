@@ -144,9 +144,7 @@ impl Drop for Gum {
         let Some(it) = singleton.take_if(|it| Arc::strong_count(it) == 1) else {
             return;
         };
-        Arc::try_unwrap(it)
-            .ok()
-            .expect("should destroy the one instance");
+        Arc::try_unwrap(it).ok().expect("should destroy the one instance");
     }
 }
 
@@ -200,12 +198,7 @@ impl TryFrom<NativePointer> for String {
         if ptr.is_null() {
             Err(Error::MemoryAccessError)
         } else {
-            unsafe {
-                Ok(
-                    Self::from_utf8_lossy(CStr::from_ptr(ptr.0 as *const c_char).to_bytes())
-                        .into_owned(),
-                )
-            }
+            unsafe { Ok(Self::from_utf8_lossy(CStr::from_ptr(ptr.0 as *const c_char).to_bytes()).into_owned()) }
         }
     }
 }

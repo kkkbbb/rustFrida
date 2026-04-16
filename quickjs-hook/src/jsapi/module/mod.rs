@@ -18,6 +18,7 @@ use std::ffi::CString;
 include!("types.rs");
 include!("maps.rs");
 include!("elf.rs");
+include!("enumerate.rs");
 include!("linker.rs");
 include!("resolve.rs");
 include!("api.rs");

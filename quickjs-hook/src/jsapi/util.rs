@@ -60,10 +60,7 @@ impl ProcMapEntry<'_> {
 /// 使用 `String::from_utf8` 快速路径，仅在内容包含非 UTF-8 字节时回退到 lossy 转换。
 pub(crate) fn read_proc_self_maps() -> Option<String> {
     let bytes = std::fs::read("/proc/self/maps").ok()?;
-    Some(
-        String::from_utf8(bytes)
-            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()),
-    )
+    Some(String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()))
 }
 
 pub(crate) fn parse_proc_map_line(line: &str) -> Option<ProcMapEntry<'_>> {
@@ -107,10 +104,6 @@ pub(crate) fn is_addr_accessible(addr: u64, size: usize) -> bool {
         let region_len = end.saturating_sub(page_addr);
         let pages = (region_len + PAGE_SIZE - 1) / PAGE_SIZE;
         let mut vec = vec![0u8; pages];
-        libc::mincore(
-            page_addr as *mut libc::c_void,
-            region_len,
-            vec.as_mut_ptr() as *mut _,
-        ) == 0
+        libc::mincore(page_addr as *mut libc::c_void, region_len, vec.as_mut_ptr() as *mut _) == 0
     }
 }

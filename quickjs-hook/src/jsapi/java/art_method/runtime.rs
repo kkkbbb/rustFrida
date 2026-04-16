@@ -79,7 +79,7 @@ unsafe fn verify_class_linker_offset(
     let it_ptr = safe_read_u64(runtime + intern_table_offset as u64) & PAC_STRIP_MASK;
 
     if cl_ptr == 0 || it_ptr == 0 {
-        output_message(&format!(
+        output_verbose(&format!(
             "[art runtime] 交叉验证跳过: classLinker*={:#x}, internTable*={:#x}",
             cl_ptr, it_ptr
         ));
@@ -93,7 +93,7 @@ unsafe fn verify_class_linker_offset(
     for offset in (scan_start..scan_end).step_by(PTR_SIZE) {
         let val = safe_read_u64(cl_ptr + offset as u64) & PAC_STRIP_MASK;
         if val == it_ptr {
-            output_message(&format!(
+            output_verbose(&format!(
                 "[art runtime] 交叉验证通过: 在 ClassLinker+{:#x} 找到 InternTable*={:#x}",
                 offset, it_ptr
             ));
@@ -101,7 +101,7 @@ unsafe fn verify_class_linker_offset(
         }
     }
 
-    output_message(&format!(
+    output_verbose(&format!(
         "[art runtime] 交叉验证失败: ClassLinker({:#x}) 中未找到 InternTable*({:#x})",
         cl_ptr, it_ptr
     ));
@@ -116,7 +116,7 @@ unsafe fn probe_art_runtime_spec() -> Option<ArtRuntimeSpec> {
     let (runtime, java_vm_off) = match find_runtime_java_vm() {
         Some(v) => v,
         None => {
-            output_message("[art runtime] 无法获取 Runtime/java_vm_ 偏移");
+            output_verbose("[art runtime] 无法获取 Runtime/java_vm_ 偏移");
             return None;
         }
     };
@@ -134,13 +134,13 @@ unsafe fn probe_art_runtime_spec() -> Option<ArtRuntimeSpec> {
         let intern_table_candidate = candidate - PTR_SIZE;
         if verify_class_linker_offset(runtime, candidate, intern_table_candidate) {
             class_linker_offset = Some(candidate);
-            output_message(&format!(
+            output_verbose(&format!(
                 "[art runtime] classLinker 候选 Runtime+{:#x} 验证通过",
                 candidate
             ));
             break;
         }
-        output_message(&format!(
+        output_verbose(&format!(
             "[art runtime] classLinker 候选 Runtime+{:#x} 验证失败，尝试下一个",
             candidate
         ));
@@ -150,14 +150,14 @@ unsafe fn probe_art_runtime_spec() -> Option<ArtRuntimeSpec> {
     let class_linker_offset = match class_linker_offset {
         Some(off) => off,
         None => {
-            output_message("[art runtime] 所有候选交叉验证失败，退回首个非空候选");
+            output_verbose("[art runtime] 所有候选交叉验证失败，退回首个非空候选");
             match candidates.iter().find(|&&off| {
                 let ptr = safe_read_u64(runtime + off as u64) & PAC_STRIP_MASK;
                 ptr != 0
             }) {
                 Some(&off) => off,
                 None => {
-                    output_message("[art runtime] 无有效 classLinker 候选");
+                    output_verbose("[art runtime] 无有效 classLinker 候选");
                     return None;
                 }
             }
@@ -194,11 +194,11 @@ unsafe fn probe_art_runtime_spec() -> Option<ArtRuntimeSpec> {
     let it_ptr = safe_read_u64(runtime + intern_table_offset as u64) & PAC_STRIP_MASK;
 
     if cl_ptr == 0 {
-        output_message("[art runtime] classLinker 指针为空，探测失败");
+        output_verbose("[art runtime] classLinker 指针为空，探测失败");
         return None;
     }
 
-    output_message(&format!(
+    output_verbose(&format!(
         "[art runtime] 探测成功: heap={:#x}, threadList={:#x}, internTable={:#x}, classLinker={:#x}{}",
         heap_offset, thread_list_offset, intern_table_offset, class_linker_offset,
         if let Some(jni_off) = jni_id_manager_offset {
@@ -207,7 +207,7 @@ unsafe fn probe_art_runtime_spec() -> Option<ArtRuntimeSpec> {
             String::new()
         }
     ));
-    output_message(&format!(
+    output_verbose(&format!(
         "[art runtime] 验证: classLinker*={:#x}, internTable*={:#x}, Runtime={:#x}",
         cl_ptr, it_ptr, runtime
     ));
@@ -248,11 +248,11 @@ pub(super) fn probe_jni_ids_indirection_offset() -> Option<usize> {
         crate::jsapi::module::libart_dlsym("_ZN3art7Runtime12SetJniIdTypeENS_9JniIdTypeE")
     };
     if sym.is_null() {
-        output_message("[jniIds] SetJniIdType 符号未找到");
+        output_verbose("[jniIds] SetJniIdType 符号未找到");
         return None;
     }
 
-    output_message(&format!("[jniIds] SetJniIdType={:#x}", sym as u64));
+    output_verbose(&format!("[jniIds] SetJniIdType={:#x}", sym as u64));
 
     // 扫描前 20 条指令，查找 (LDR + CMP) 或 (STR + BL) 指令对
     let func_addr = sym as u64;
@@ -279,7 +279,7 @@ pub(super) fn probe_jni_ids_indirection_offset() -> Option<usize> {
                 let imm12 = ((prev_insn >> 10) & 0xFFF) as usize;
                 let scale = if prev_is_ldr64 { 8 } else { 4 };
                 let offset = imm12 * scale;
-                output_message(&format!(
+                output_verbose(&format!(
                     "[jniIds] LDR+CMP 模式: offset={} ({}bit LDR)",
                     offset,
                     if prev_is_ldr64 { 64 } else { 32 }
@@ -297,7 +297,7 @@ pub(super) fn probe_jni_ids_indirection_offset() -> Option<usize> {
                 let imm12 = ((prev_insn >> 10) & 0xFFF) as usize;
                 let scale = if prev_is_str64 { 8 } else { 4 };
                 let offset = imm12 * scale;
-                output_message(&format!(
+                output_verbose(&format!(
                     "[jniIds] STR+BL 模式: offset={} ({}bit STR)",
                     offset,
                     if prev_is_str64 { 64 } else { 32 }
@@ -309,6 +309,6 @@ pub(super) fn probe_jni_ids_indirection_offset() -> Option<usize> {
         prev_insn = insn;
     }
 
-    output_message("[jniIds] 未找到 jniIdsIndirection 偏移");
+    output_verbose("[jniIds] 未找到 jniIdsIndirection 偏移");
     None
 }

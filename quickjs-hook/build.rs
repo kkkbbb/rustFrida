@@ -6,16 +6,21 @@ fn main() {
     let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
     let src_path = PathBuf::from(&manifest_dir).join("src");
 
-    // Compile hook_engine.c, arm64_writer.c, and arm64_relocator.c
+    // Compile hook_engine.c, arm64_writer.c, arm64_relocator.c,
+    // 以及 native_call.S (AAPCS64 变参调用 shim)
     cc::Build::new()
         .file(src_path.join("hook_engine.c"))
         .file(src_path.join("hook_engine_mem.c"))
         .file(src_path.join("hook_engine_inline.c"))
         .file(src_path.join("hook_engine_redir.c"))
         .file(src_path.join("hook_engine_art.c"))
+        .file(src_path.join("hook_engine_oat_patch.c"))
         .file(src_path.join("arm64_writer.c"))
         .file(src_path.join("arm64_relocator.c"))
+        .file(src_path.join("recomp/recomp_page.c"))
+        .file(src_path.join("native_call.S"))
         .include(&src_path)
+        .include(src_path.join("recomp"))
         .opt_level(2)
         .flag("-fPIC")
         .flag("-fno-exceptions")
@@ -67,12 +72,7 @@ fn main() {
         // Generate bindings for QuickJS + wrapper
         let bindings = bindgen::Builder::default()
             .header(quickjs_src.join("quickjs.h").to_string_lossy().to_string())
-            .header(
-                src_path
-                    .join("quickjs_wrapper.h")
-                    .to_string_lossy()
-                    .to_string(),
-            )
+            .header(src_path.join("quickjs_wrapper.h").to_string_lossy().to_string())
             .clang_arg(format!("-I{}", quickjs_src.display()))
             .clang_arg(format!("-I{}", src_path.display()))
             .clang_arg("-xc")
@@ -103,31 +103,17 @@ fn main() {
         )
         .expect("Failed to write placeholder bindings");
 
-        println!(
-            "cargo:warning=QuickJS source not initialized at {:?}",
-            quickjs_src
-        );
-        println!(
-            "cargo:warning=Run: git submodule update --init --recursive quickjs-hook/quickjs-src"
-        );
+        println!("cargo:warning=QuickJS source not initialized at {:?}", quickjs_src);
+        println!("cargo:warning=Run: git submodule update --init --recursive quickjs-hook/quickjs-src");
         println!("cargo:warning=Or run: cd quickjs-hook && ./setup_quickjs.sh");
     }
 
     // Generate bindings for hook_engine (includes arm64_writer and arm64_relocator)
     let hook_bindings = bindgen::Builder::default()
         .header(src_path.join("hook_engine.h").to_string_lossy().to_string())
-        .header(
-            src_path
-                .join("arm64_writer.h")
-                .to_string_lossy()
-                .to_string(),
-        )
-        .header(
-            src_path
-                .join("arm64_relocator.h")
-                .to_string_lossy()
-                .to_string(),
-        )
+        .header(src_path.join("arm64_writer.h").to_string_lossy().to_string())
+        .header(src_path.join("arm64_relocator.h").to_string_lossy().to_string())
+        .header(src_path.join("recomp/recomp_page.h").to_string_lossy().to_string())
         .clang_arg(format!("-I{}", src_path.display()))
         .clang_arg("-xc")
         .generate_comments(true)
@@ -137,9 +123,15 @@ fn main() {
         .allowlist_function("hook_.*")
         .allowlist_function("arm64_writer_.*")
         .allowlist_function("arm64_relocator_.*")
+        .allowlist_function("recompile_page")
+        .allowlist_function("arm64_install_user_patch")
+        .allowlist_function("resolve_art_trampoline")
+        .allowlist_function("wxshadow_.*")
         .allowlist_type("Hook.*")
         .allowlist_type("Arm64.*")
+        .allowlist_type("RecompileStats")
         .allowlist_var("ARM64_.*")
+        .allowlist_var("RECOMP_.*")
         .use_core()
         .generate()
         .expect("Unable to generate hook_engine bindings");
@@ -156,10 +148,14 @@ fn main() {
     println!("cargo:rerun-if-changed=src/hook_engine_inline.c");
     println!("cargo:rerun-if-changed=src/hook_engine_redir.c");
     println!("cargo:rerun-if-changed=src/hook_engine_art.c");
+    println!("cargo:rerun-if-changed=src/hook_engine_oat_patch.c");
     println!("cargo:rerun-if-changed=src/arm64_writer.c");
     println!("cargo:rerun-if-changed=src/arm64_writer.h");
     println!("cargo:rerun-if-changed=src/arm64_relocator.c");
     println!("cargo:rerun-if-changed=src/arm64_relocator.h");
+    println!("cargo:rerun-if-changed=src/recomp/recomp_page.c");
+    println!("cargo:rerun-if-changed=src/recomp/recomp_page.h");
+    println!("cargo:rerun-if-changed=src/native_call.S");
     println!("cargo:rerun-if-changed=quickjs-src/VERSION");
     println!("cargo:rerun-if-changed=quickjs-src/quickjs.c");
     println!("cargo:rerun-if-changed=quickjs-src/quickjs.h");

@@ -4,15 +4,9 @@
  * Licence: wxWindows Library Licence, Version 3.1
  */
 
-#![cfg_attr(
-    any(target_arch = "x86_64", target_arch = "x86"),
-    allow(clippy::unnecessary_cast)
-)]
+#![cfg_attr(any(target_arch = "x86_64", target_arch = "x86"), allow(clippy::unnecessary_cast))]
 
-use {
-    crate::NativePointer, core::ffi::c_void, frida_gum_sys as gum_sys,
-    gum_sys::_GumEvent as GumEvent,
-};
+use {crate::NativePointer, core::ffi::c_void, frida_gum_sys as gum_sys, gum_sys::_GumEvent as GumEvent};
 
 #[derive(FromPrimitive)]
 #[repr(u32)]
@@ -111,10 +105,7 @@ unsafe extern "C" fn call_start<S: EventSink>(user_data: *mut c_void) {
     event_sink.start();
 }
 
-unsafe extern "C" fn call_process<S: EventSink>(
-    user_data: *mut c_void,
-    event: *const frida_gum_sys::GumEvent,
-) {
+unsafe extern "C" fn call_process<S: EventSink>(user_data: *mut c_void, event: *const frida_gum_sys::GumEvent) {
     let event_sink: &mut S = &mut *(user_data as *mut S);
     event_sink.process(&(*event).into());
 }
@@ -129,16 +120,12 @@ unsafe extern "C" fn call_stop<S: EventSink>(user_data: *mut c_void) {
     event_sink.stop();
 }
 
-unsafe extern "C" fn call_query_mask<S: EventSink>(
-    user_data: *mut c_void,
-) -> frida_gum_sys::GumEventType {
+unsafe extern "C" fn call_query_mask<S: EventSink>(user_data: *mut c_void) -> frida_gum_sys::GumEventType {
     let event_sink: &mut S = &mut *(user_data as *mut S);
     event_sink.query_mask() as u32
 }
 
-pub(crate) fn event_sink_transform<S: EventSink>(
-    event_sink: &mut S,
-) -> *mut frida_gum_sys::GumEventSink {
+pub(crate) fn event_sink_transform<S: EventSink>(event_sink: &mut S) -> *mut frida_gum_sys::GumEventSink {
     let rust = frida_gum_sys::RustEventSinkVTable {
         user_data: event_sink as *mut _ as *mut c_void,
         query_mask: Some(call_query_mask::<S>),

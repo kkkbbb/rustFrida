@@ -1,778 +1,756 @@
-# rustFrida JS API 使用说明
+# rustFrida
 
-本文档只说明 `rust_frida` 里可直接使用的 JavaScript API。当前实现面向 `Android + ARM64`，JS 运行时为内嵌 `QuickJS`。
+ARM64 Android 动态插桩框架。
 
-## 0. 最近更新
-- 仓库现在使用 `Git LFS` 管理 `qbdi/libQBDI.a`
-  - 首次克隆后需要执行：
+## 环境要求
+
+- Android NDK 25+（默认路径 `~/Android/Sdk/ndk/`）
+- Rust toolchain + `aarch64-linux-android` target
+- Python 3（构建 loader shellcode）
+- `.cargo/config.toml` 已配置交叉编译（仓库自带）
+
+## 构建
+
+最终产物 `rustfrida` 通过 `include_bytes!` 内嵌了 loader shellcode 和 agent SO，有严格的**构建顺序**：
+
+```
+loader shellcode  ──┐
+                    ├──→  rustfrida (主程序)
+agent (libagent.so) ┘
+```
+
+### 1. 构建 loader shellcode（bootstrapper + rustfrida-loader）
 
 ```bash
-git lfs install
-git lfs pull
+python3 build_helpers.py
+# 输出:
+#   loader/build/bootstrapper.bin
+#   loader/build/rustfrida-loader.bin
 ```
 
-- JS 全局对象新增 `qbdi`
-  - 用于在设备侧直接创建 QBDI VM、配置插桩范围、模拟调用、执行 `run()` 和读取寄存器返回值。
+loader 是 bare-metal ARM64 shellcode，被 `rustfrida` 通过 `include_bytes!` 嵌入。**修改 loader C 代码后需重新运行此步。**
 
-## 1. 进入 JS 环境
+### 2. 构建 agent（libagent.so）
 
-注入成功后，在 `rust_frida` 的交互界面里可用下面几个命令：
-
-- `jsinit`
-  - 初始化 QuickJS 引擎。
-- `loadjs <script>`
-  - 执行一段 JS 代码。
-- `jseval <expr>`
-  - 求值一个 JS 表达式并打印结果。
-- `jsrepl`
-  - 进入交互式 JS REPL，支持 Tab 补全。
-- `jsclean`
-  - 清理 QuickJS 引擎和已安装的 JS hook。
-
-常见用法：
-
-```text
-jsinit
-jseval Module.findBaseAddress("libart.so").toString()
-loadjs console.log("hello from quickjs")
-jsrepl
+```bash
+cargo build -p agent --release
+# 输出: target/aarch64-linux-android/release/libagent.so
 ```
 
-如果是 `spawn` 模式，涉及应用类的 Java hook 建议放在 `Java.ready(() => { ... })` 里执行。
+agent 是注入到目标进程的动态库，包含 hook 引擎、QuickJS、Java hook 等。**必须先于 rustfrida 构建**，因为 rustfrida 通过 `include_bytes!` 嵌入 agent SO。
 
-## 2. 全局对象一览
+### 3. 构建 rustfrida（主程序）
 
-初始化后，JS 全局可直接使用这些对象/函数：
+```bash
+cargo build -p rust_frida --release
+# 输出: target/aarch64-linux-android/release/rustfrida
+```
 
-- `console`
-- `ptr()`
-- `Memory`
-- `Module`
-- `hook()`
-- `unhook()`
-- `callNative()`
-- `qbdi`
-- `Java`
-- `Jni`
+rustfrida 内嵌了 `bootstrapper.bin` + `rustfrida-loader.bin` + `libagent.so`，是一个自包含的单文件。
 
-## 3. 类型速查
+### 可选组件（单独构建）
 
-### 3.1 常用类型别名
+这些不在 default-members 里，按需构建：
+
+**QBDI Trace 支持：** 需要先构建 qbdi-helper SO，再用 `--features qbdi` 编译 agent 和 rustfrida：
+
+```bash
+cargo build -p qbdi-helper --release           # → libqbdi_helper.so
+cargo build -p agent --release --features qbdi  # agent 启用 qbdi feature
+cargo build -p rust_frida --release --features qbdi  # rustfrida 嵌入 qbdi-helper SO
+```
+
+**eBPF SO 加载监控（`--watch-so`）：** ldmonitor 是 rustfrida 的编译依赖，默认构建已包含，`--watch-so` 无需额外步骤。如需独立使用 ldmonitor 命令行工具：
+
+```bash
+cargo build -p ldmonitor --release    # → ldmonitor 独立二进制
+```
+
+## 部署 & 运行
+
+```bash
+adb push target/aarch64-linux-android/release/rustfrida /data/local/tmp/
+
+# PID 注入
+./rustfrida --pid <pid>
+./rustfrida --pid <pid> -l script.js
+
+# Spawn 模式（启动时注入）
+./rustfrida --spawn com.example.app
+./rustfrida --spawn com.example.app -l script.js
+
+# 等待 SO 加载后注入（eBPF）
+./rustfrida --watch-so libnative.so
+
+# 详细日志
+./rustfrida --pid <pid> --verbose
+```
+
+### REPL 命令
+
+```
+jsinit              # 初始化 JS 引擎
+jseval <expr>       # 求值表达式
+loadjs <script>     # 执行脚本
+jsrepl              # 交互式 REPL（Tab 补全）
+exit                # 退出
+```
+
+---
+
+## HTTP RPC 远程调用
+
+脚本里用 Frida 风格的 `rpc.exports` 注册方法，host 端通过 HTTP POST 调用，返回值会 `JSON.stringify` 后透传回来。适合把 agent 当成一个常驻服务用——UI、自动化脚本、测试框架都可以直接 `curl` 触发。
+
+### 启动
+
+在 legacy 单会话或 `--server` 多会话模式下，加上 `--rpc-port` 即可启动 HTTP 服务器。参数可以是纯端口号（默认绑 `0.0.0.0`），也可以是完整地址：
+
+```bash
+# legacy 模式：attach + 加载脚本 + 开 RPC 端口
+./rustfrida --pid 1234 -l rpc_test.js --rpc-port 9191
+
+# server 模式：多 session 共享同一个 RPC 端口，按 session id 路由
+./rustfrida --server --rpc-port 127.0.0.1:9191
+
+# 本机访问通过 adb forward 最简单
+adb forward tcp:9191 tcp:9191
+```
+
+### JS 侧注册
+
+```js
+// 整体替换
+rpc.exports = {
+    ping: function() { return "pong"; },
+    add: function(a, b) { return a + b; },
+    echo: function(obj) { return { received: obj, ts: Date.now() }; },
+
+    // 读取当前 App 的 package name + label
+    getAppName: function() {
+        var ActivityThread = Java.use("android.app.ActivityThread");
+        var app = ActivityThread.currentApplication();
+        var ctx = app.getApplicationContext();
+        var pm = ctx.getPackageManager();
+        return {
+            packageName: String(ctx.getPackageName()),
+            label: String(pm.getApplicationLabel(ctx.getApplicationInfo())),
+        };
+    }
+};
+
+// 或者单独追加
+rpc.export('version', function() { return "1.0.0"; });
+```
+
+`rpc.exports` 就是个普通 JS 对象，**现场 lookup，不需要向 host 注册方法列表**——你可以任意时刻增删改，下一次 HTTP 请求立刻生效。
+
+### HTTP 路由
+
+| 方法 | 路径 | Body | 说明 |
+| --- | --- | --- | --- |
+| `GET` | `/` / `/health` | — | 健康检查 |
+| `GET` | `/sessions` | — | 列出所有 session（id/pid/label/status）|
+| `POST` | `/rpc/<session>/<method>` | JSON 数组 | 调用 `rpc.exports[method].apply(null, args)`；空 body 等价 `[]` |
+
+`<session>` 在 legacy 模式下固定为 `0`，在 `--server` 模式下对应 `list` 命令显示的 id。
+
+### 调用示例
+
+```bash
+# 简单调用
+curl -X POST http://127.0.0.1:9191/rpc/0/ping
+# → {"ok":true,"result":"pong"}
+
+# 位置参数（JSON 数组）
+curl -X POST http://127.0.0.1:9191/rpc/0/add -d '[3,4]'
+# → {"ok":true,"result":7}
+
+# 对象参数
+curl -X POST http://127.0.0.1:9191/rpc/0/echo -d '[{"foo":1,"bar":"hi"}]'
+# → {"ok":true,"result":{"received":{"foo":1,"bar":"hi"},"ts":1775806588866}}
+
+# Java 集成
+curl -X POST http://127.0.0.1:9191/rpc/0/getAppName
+# → {"ok":true,"result":{"packageName":"com.android.settings","label":"设置"}}
+
+# 列出 session
+curl http://127.0.0.1:9191/sessions
+# → [{"id":0,"pid":1234,"label":"PID:1234","status":"connected"}]
+```
+
+成功响应统一是 `{"ok":true,"result":<value>}`；失败是 `{"ok":false,"error":"<msg>"}`，HTTP 状态码 400（参数错）/404（session/method 不存在）/503（session 未连接）/500（JS 异常或超时）。
+
+### 行为约束
+
+- **返回值必须 JSON-safe**：`JSON.stringify` 在 JS 侧执行，函数/循环引用/`undefined` 会被跳过。直接 `return` 一个 Java wrapper 只会得到指针字面量——请手动 `String(obj.method())` 或构造 plain object。
+- **并发串行化**：同一 session 内 HTTP 请求排队执行；跨 session 完全并行。
+- **超时 30 秒**：超时返回 `{"ok":false,"error":"rpc call timed out"}`。长耗时任务请改用轮询接口。
+- **仅同步**：不支持 `async` / Promise——Promise 会被 `JSON.stringify` 成 `{}`。
+
+---
+
+## JS API 参考
+
+### 全局对象一览
+
+`console`, `ptr()`, `Memory`, `Module`, `hook()`, `unhook()`, `callNative()`, `qbdi`, `Java`, `Jni`
+
+### 常用类型别名
 
 | 类型名 | 实际含义 |
 | --- | --- |
 | `AddressLike` | `NativePointer \| number \| bigint \| "0x..."` |
-| `NativePointer` | `ptr()` 创建出来的指针对象 |
-| `JsNumber` | JS `number` |
-| `JsBigInt` | JS `bigint` |
+| `NativePointer` | `ptr()` 创建的指针对象 |
 | `JavaObjectProxy` | `Java.use()` / Java hook 中返回的 Java 对象代理 |
-| `ArrayBuffer` | `Memory.readByteArray()` 返回的字节数组 |
 
-补充说明：
+### 结构体 / 上下文对象
 
-- 地址参数基本都可以写成 `AddressLike`
-- 64 位值在 JS 里可能表现为 `number` 或 `bigint`，取决于实现是否需要避免精度丢失
-- `NativePointer.toString()` / `JSON.stringify()` 时会输出十六进制字符串
+```ts
+type ModuleInfo = {
+  name: string; base: NativePointer; size: number; path: string
+}
 
-### 3.2 API 参数 / 返回值速查
+type NativeHookContext = {
+  x0 ~ x30: number | bigint    // ARM64 通用寄存器
+  sp: number | bigint
+  pc: number | bigint
+  trampoline: number | bigint
+  orig(): number | bigint       // 调用原函数，返回值写入 x0
+}
 
-#### console
+type JavaHookContext = {
+  thisObj?: JavaObjectProxy     // 实例方法的 this（静态方法无）
+                                // 字段: thisObj.field.value 读/写
+                                // 方法: thisObj.method(args) 调用
+  args: any[]                   // 参数数组（Object 参数自动包装为 Proxy）
+  env: number | bigint          // JNIEnv*
+  orig(...args: any[]): any     // 调原方法，不传参用原始参数
+}
 
-| API | 参数类型 | 返回类型 |
+type JniEntry = { name: string; index: number; address: NativePointer }
+
+type JNINativeMethodInfo = {
+  address: NativePointer; namePtr: NativePointer; sigPtr: NativePointer
+  fnPtr: NativePointer; name: string | null; sig: string | null
+}
+```
+
+---
+
+## Native Hook
+
+```js
+// 基本 hook — 透传
+hook(Module.findExportByName("libc.so", "open"), function(ctx) {
+    console.log("open:", Memory.readCString(ptr(ctx.x0)));
+    return ctx.orig();
+});
+
+// 修改返回值
+hook(Module.findExportByName("libc.so", "getpid"), function(ctx) {
+    ctx.orig();
+    return 12345;              // 调用方拿到 12345
+});
+
+// 修改参数 — 通过 ctx 属性
+hook(target, function(ctx) {
+    ctx.x0 = ptr("0x1234");   // 改第一个参数
+    ctx.x1 = 100;             // 改第二个参数
+    return ctx.orig();         // 用修改后的参数调原函数
+});
+
+// 修改参数 — 通过 orig() 传参（按顺序覆盖 x0-xN）
+hook(target, function(ctx) {
+    return ctx.orig(ptr("0x1234"), 100);
+});
+
+// 不 return 也行 — ctx.x0 赋值会同步回 C 层
+hook(Module.findExportByName("libc.so", "getuid"), function(ctx) {
+    ctx.orig();
+    ctx.x0 = 77777;           // 调用方拿到 77777
+});
+
+// 移除 hook
+unhook(Module.findExportByName("libc.so", "open"));
+
+// 直接调用 native 函数（最多 6 个参数，走 x0-x5）
+var pid = callNative(Module.findExportByName("libc.so", "getpid"));
+```
+
+### NativeFunction（任意签名调用）
+
+Frida 兼容 API，任意参数数量（寄存器用完自动栈溢出，上限 256 个栈参数）。
+
+```js
+var open = new NativeFunction(
+    Module.findExportByName("libc.so", "open"),
+    "int",                            // 返回类型
+    ["pointer", "int"]                // 参数类型
+);
+var fd = open(Memory.allocUtf8String("/tmp/foo"), 0);
+
+var atan2 = new NativeFunction(
+    Module.findExportByName("libm.so", "atan2"),
+    "double",
+    ["double", "double"]
+);
+atan2(1.0, 2.0);
+```
+
+**支持的类型**：`void`, `bool`, `char`/`uchar`, `int8`/`uint8`, `short`/`ushort`, `int16`/`uint16`, `int`/`uint`, `int32`/`uint32`, `long`/`ulong` (64-bit), `int64`/`uint64`, `size_t`/`ssize_t`, `pointer`, `float`, `double`。
+
+AAPCS64 调用约定：整数/指针先填 x0-x7，浮点先填 d0-d7（两队列独立），超出部分自动压栈。不支持 struct-by-value。
+
+### Memory 堆分配
+
+```js
+var buf = Memory.alloc(128);                 // 分配 128 字节 RWX 内存 → NativePointer
+var str = Memory.allocUtf8String("hello");   // 分配并写入 UTF-8 字符串 → NativePointer
+```
+
+### Stealth 模式
+
+```js
+hook(target, callback, Hook.NORMAL)     // 0: mprotect 直写（默认）
+hook(target, callback, Hook.WXSHADOW)   // 1: 内核 shadow 页，/proc/mem 不可见
+hook(target, callback, Hook.RECOMP)     // 2: 代码页重编译，仅 4B patch
+hook(target, callback, 1)               // 数字也行
+hook(target, callback, true)            // true = WXSHADOW
+```
+
+### API 速查
+
+| API | 参数 | 返回 |
 | --- | --- | --- |
-| `console.log(...args)` | `any[]` | `undefined` |
-| `console.info(...args)` | `any[]` | `undefined` |
-| `console.warn(...args)` | `any[]` | `undefined` |
-| `console.error(...args)` | `any[]` | `undefined` |
-| `console.debug(...args)` | `any[]` | `undefined` |
+| `hook(target, callback, stealth?)` | `AddressLike, Function, number?` | `boolean` |
+| `unhook(target)` | `AddressLike` | `boolean` |
+| `callNative(func, ...args)` | `AddressLike, ...AddressLike` (最多6个) | `number \| bigint` |
+| `new NativeFunction(addr, retType, argTypes)` | `AddressLike, string, string[]` | `Function` (可调用，任意签名) |
+| `Memory.alloc(size)` | `number` | `NativePointer` (RWX 堆内存) |
+| `Memory.allocUtf8String(s)` | `string` | `NativePointer` |
+| `diagAllocNear(addr)` | `AddressLike` | `undefined` |
 
-#### ptr / NativePointer
+---
 
-| API | 参数类型 | 返回类型 |
+## Java Hook
+
+```js
+Java.ready(function() {
+    var Activity = Java.use("android.app.Activity");
+
+    // hook 实例方法（return 值就是方法返回值）
+    Activity.onResume.impl = function(ctx) {
+        console.log("onResume:", ctx.thisObj.$className);
+        return ctx.orig();
+    };
+
+    // hook 构造函数
+    var MyClass = Java.use("com.example.MyClass");
+    MyClass.$init.impl = function(ctx) {
+        console.log("new MyClass, arg0 =", ctx.args[0]);
+        return ctx.orig();
+    };
+
+    // 修改参数
+    MyClass.test.impl = function(ctx) {
+        return ctx.orig("patched_arg");
+    };
+
+    // 指定 overload（Java 类型名或 JNI 签名都行）
+    MyClass.foo.overload("int", "java.lang.String").impl = function(ctx) {
+        return ctx.orig();
+    };
+
+    // 移除 hook
+    Activity.onResume.impl = null;
+});
+```
+
+### Java.use 对象操作
+
+```js
+var JString = Java.use("java.lang.String");
+var s = JString.$new("hello");     // 创建对象
+console.log(s.length());           // 调实例方法
+console.log(s.$className);         // 类名
+
+var Process = Java.use("android.os.Process");
+console.log(Process.myPid());      // 调静态方法
+```
+
+### 字段访问（Frida 兼容 .value 模式）
+
+字段通过 `.value` 读写，每次直接走 JNI，无缓存锁：
+
+```js
+// 静态字段
+var Build = Java.use("android.os.Build");
+console.log(Build.MODEL.value);          // 读: "Pixel 6"
+Build.MODEL.value = "FakeModel";         // 写
+
+// 实例字段（hook 回调中 / $new 创建的对象）
+var Point = Java.use("android.graphics.Point");
+var p = Point.$new(10, 20);
+console.log(p.x.value, p.y.value);      // 读: 10, 20
+p.x.value = 100;                         // 写: JVM 同步更新
+console.log(p.toString());               // "Point(100, 20)"
+
+// hook 中访问 this 字段
+Activity.onResume.impl = function(ctx) {
+    var name = ctx.thisObj.mComponent.value;  // 读实例字段
+    console.log("resuming:", name);
+    return ctx.orig();
+};
+```
+
+**字段/方法同名**：Java 允许同名字段和方法共存。此时返回 hybrid——既可调用（方法）又有 `.value`（字段）：
+
+```js
+var map = HashMap.$new();
+map.size();        // 调用 size() 方法
+map.size.value;    // 读取 size 字段
+```
+
+### Java.ready
+
+Spawn 模式下 app ClassLoader 未就绪，用 `Java.ready` 延迟执行。PID 注入模式下立即执行。
+
+### Java.choose 枚举存活实例（Frida 兼容）
+
+扫描 ART 堆，把目标类的所有存活实例交给 `onMatch`：
+
+```js
+Java.choose("android.app.Activity", {
+    onMatch: function(instance) {
+        console.log(instance.$className, "=>", instance.toString());
+        // return "stop";   // 提前终止
+    },
+    onComplete: function() { console.log("done"); },
+    subtypes: true,         // 包含子类（rustFrida 扩展）
+    maxCount: 1000          // 最多枚举数量，默认 16384；0 = 不限
+});
+
+// 第三参等价 subtypes（位置参数形式）
+Java.choose("java.util.List", { onMatch: fn }, true);
+```
+
+**生命周期**：传给 `onMatch` 的 wrapper **仅在 onMatch 执行期间有效**。函数返回后 `__jptr` 被置 0。若要跨回调保留实例，请在 `onMatch` 内调 `String(obj.method())` 拷字段，或自行 `NewGlobalRef`。
+
+**后端**：Android ≤13 走 `VMDebug.getInstancesOfClasses`；API 36 自动降级为堆暴力扫描。
+
+### ClassLoader 控制
+
+```js
+var loaders = Java.classLoaders();             // → 数组: app + boot + system
+Java.setClassLoader(loaders[0]);               // 切换 Java.use() 查找上下文
+var MyCls = Java.findClassWithLoader(loaders[0], "com.example.MyClass");
+```
+
+`loader` 参数接受 loader 对象、`{__jptr}` wrapper 或 `NativePointer`。Spawn 模式下 app loader 就绪前 `Java.classLoaders()` 可能只返回 boot loader，应在 `Java.ready()` 里调。
+
+### Stealth 模式（Java hook）
+
+```js
+Java.setStealth(0);  // Normal: mprotect 直写
+Java.setStealth(1);  // WxShadow: shadow 页，CRC 校验不可见
+Java.setStealth(2);  // Recomp: 代码页重编译
+Java.getStealth();   // 查询当前模式 (0/1/2)
+```
+
+须在 `Java.use().impl` 之前设置。
+
+### Deopt API
+
+```js
+Java.deopt();                  // 清空 JIT 缓存（InvalidateAllMethods）
+Java.deoptimizeBootImage();    // boot image AOT 降级为 interpreter (API >= 26)
+Java.deoptimizeEverything();   // 全局强制解释执行
+Java.deoptimizeMethod("com.example.Test", "foo", "(I)V");  // 单方法降级
+```
+
+手动调用的工具函数，hook 流程不自动使用。
+
+### API 速查
+
+| API | 参数 | 返回 |
+| --- | --- | --- |
+| `Java.use(className)` | `string` | `JavaClassWrapper` |
+| `Class.$new(...args)` | 任意 | `JavaObjectProxy` |
+| `Class.method.impl = fn` | `(ctx: JavaHookContext) => any` | setter |
+| `Class.method.impl = null` | — | setter |
+| `Class.method.overload(...types)` | `string...` | `MethodWrapper` |
+| `Java.ready(fn)` | `() => void` | `void` |
+| `Java.choose(cls, callbacks, subtypes?)` | `string, {onMatch,onComplete?,subtypes?,maxCount?}, bool?` | `void` |
+| `Java.classLoaders()` | — | `LoaderInfo[]` |
+| `Java.findClassWithLoader(loader, cls)` | `Loader, string` | `JavaClassWrapper` |
+| `Java.setClassLoader(loader)` | `Loader` | — |
+| `Java.deopt()` | — | `boolean` |
+| `Java.deoptimizeBootImage()` | — | `boolean` |
+| `Java.deoptimizeEverything()` | — | `boolean` |
+| `Java.deoptimizeMethod(cls, method, sig)` | `string, string, string` | `boolean` |
+| `Java.setStealth(mode)` | `number (0/1/2)` | — |
+| `Java.getStealth()` | — | `number` |
+| `obj.field.value` | — | `any` (读字段) |
+| `obj.field.value = x` | — | — (写字段) |
+| `Java.getField(objPtr, cls, field, sig)` | `AddressLike, string, string, string` | `any` (低层 API) |
+
+---
+
+## JNI API
+
+```js
+Jni.addr("RegisterNatives")       // → NativePointer
+Jni.FindClass                     // 属性直接取地址
+Jni.find("FindClass")             // → { name, index, address }
+Jni.table                         // 整张 JNI 函数表
+Jni.addr(envPtr, "FindClass")     // 指定 JNIEnv
+```
+
+### Jni.helper
+
+```js
+Jni.helper.env.ptr                         // 当前线程 JNIEnv*
+Jni.helper.env.getClassName(jclass)        // → "android.app.Activity"
+Jni.helper.env.getObjectClassName(jobject)  // → 对象的类名
+Jni.helper.env.readJString(jstring)        // → JS string
+Jni.helper.env.getObjectClass(obj)         // → jclass
+Jni.helper.env.getSuperclass(clazz)        // → jclass
+Jni.helper.env.isSameObject(a, b)          // → boolean
+Jni.helper.env.isInstanceOf(obj, clazz)    // → boolean
+Jni.helper.env.exceptionCheck()            // → boolean
+Jni.helper.env.exceptionClear()
+
+Jni.helper.structs.JNINativeMethod.readArray(addr, count)  // → JNINativeMethodInfo[]
+Jni.helper.structs.jvalue.readArray(addr, typesOrSig)      // → any[]
+```
+
+### API 速查
+
+| API | 参数 | 返回 |
+| --- | --- | --- |
+| `Jni.addr(name)` | `string` | `NativePointer` |
+| `Jni.addr(env, name)` | `AddressLike, string` | `NativePointer` |
+| `Jni.find(name)` | `string` | `JniEntry` |
+| `Jni.entries()` | — | `JniEntry[]` |
+| `Jni.table` | — | `Record<string, JniEntry>` |
+| `Jni.helper.env.getClassName(clazz)` | `AddressLike` | `string \| null` |
+| `Jni.helper.env.readJString(jstr)` | `AddressLike` | `string \| null` |
+| `Jni.helper.structs.JNINativeMethod.readArray(addr, count)` | `AddressLike, number` | `JNINativeMethodInfo[]` |
+
+### 实战：监控 RegisterNatives
+
+```js
+hook(Jni.addr("RegisterNatives"), function(ctx) {
+    var cls = Jni.helper.env.getClassName(ctx.x1);
+    var count = Number(ctx.x3);
+    console.log(cls + " (" + count + " methods)");
+
+    var methods = Jni.helper.structs.JNINativeMethod.readArray(ptr(ctx.x2), count);
+    for (var i = 0; i < methods.length; i++) {
+        var m = methods[i];
+        var mod = Module.findByAddress(m.fnPtr);
+        console.log("  " + m.name + " " + m.sig + " → " + mod.name + "+" + m.fnPtr.sub(mod.base));
+    }
+    return ctx.orig();
+}, 1);
+```
+
+---
+
+## Memory
+
+**双风格 Frida 兼容**：`Memory.readXxx(addr)` ≡ `addr.readXxx()`，所有 read/write 方法同时挂在 `Memory` 和 `NativePointer.prototype` 上。
+
+```js
+// Memory.* 风格
+var pid = Memory.readU32(ptr("0x7f1234"));
+Memory.writeU64(dst, 0xdeadbeefn);
+var cls = Memory.readCString(ptr(ctx.x1));
+
+// ptr.* 风格（推荐，支持链式）
+var p = ptr("0x7f1234");
+p.readU32();
+p.writeU64(0xdeadbeefn);
+p.add(8).readPointer().readCString();     // 解指针再读字符串
+p.add(0x10).readByteArray(32);            // → ArrayBuffer
+
+// 写入代码后刷 I-cache
+var code = Memory.alloc(16);
+code.writeU32(0xd65f03c0);                // ret
+Memory.flushCodeCache(code, 16);
+```
+
+| API | 参数 | 返回 |
+| --- | --- | --- |
+| **读** | | |
+| `Memory.readU8/U16(addr)` / `p.readU8/U16()` | `AddressLike` | `number` |
+| `Memory.readU32/U64(addr)` / `p.readU32/U64()` | `AddressLike` | `bigint` |
+| `Memory.readPointer(addr)` / `p.readPointer()` | `AddressLike` | `NativePointer` |
+| `Memory.readCString(addr)` / `p.readCString()` | `AddressLike` | `string` (最多 4096B) |
+| `Memory.readUtf8String(addr)` / `p.readUtf8String()` | `AddressLike` | `string` |
+| `Memory.readByteArray(addr, len)` / `p.readByteArray(len)` | `AddressLike, number` | `ArrayBuffer` (≤1GB) |
+| **写** | | |
+| `Memory.writeU8/U16/U32(addr, v)` / `p.writeU8/U16/U32(v)` | `AddressLike, number` | `undefined` |
+| `Memory.writeU64(addr, v)` / `p.writeU64(v)` | `AddressLike, bigint` | `undefined` |
+| `Memory.writePointer(addr, v)` / `p.writePointer(v)` | `AddressLike, AddressLike` | `undefined` |
+| `Memory.writeBytes(addr, bytes, stealth?)` / `p.writeBytes(bytes, stealth?)` | `AddressLike, ArrayBuffer\|TypedArray\|number[], 0\|1` | `undefined` |
+| `Memory.writest(addr, bytes)` / `p.writest(bytes)` | `AddressLike, 4B 倍数指令字节` | `undefined` |
+| **分配 / 维护** | | |
+| `Memory.alloc(size)` | `number` (≤ 256MB) | `NativePointer` (RWX, 零初始化) |
+| `Memory.allocUtf8String(s)` | `string` | `NativePointer` (RWX，末尾 `\0`) |
+| `Memory.flushCodeCache(addr, size)` | `AddressLike, number` | `undefined` |
+
+**约束**：
+- 无效地址抛 `RangeError`；`readCString` 超过 4096B 抛
+- `Memory.alloc` 是 RWX 堆内存，GC 时自动释放；勿 `munmap`
+- 写入代码后必须 `Memory.flushCodeCache` 刷 I-cache
+- `writeXxx` 不会自动 mprotect；只读段写入抛错，需先 `Memory.protect`
+
+### Memory.protect / writeBytes / writest
+
+| API | 适用段 | read 可见 | 用途 |
+| --- | --- | --- | --- |
+| `Memory.protect(addr, size, "rwx")` | 任意 | — | 改页权限（页级 mprotect） |
+| `p.writeBytes(bytes, 0)` 默认 | 可写段 | 可见 | 覆盖 N 字节（数据/结构体） |
+| `p.writeBytes(bytes, 1)` | r-x | 不可见 | wxshadow 覆盖 N 字节（短 patch，单页内） |
+| `p.writest(bytes)` | r-x | 不可见 | 1 条指令 → N 条指令替换（PC-rel 自动 relocate） |
+
+`unhook(addr)` 统一清理 hook / writest / writeBytes(1) 留下的 patch。
+
+```js
+var addr = Module.findExportByName("libc.so", "getpid");
+
+// 隐身短 patch: getpid() → 42, readByteArray 仍看原字节
+addr.writeBytes(new Uint8Array([0x40,0x05,0x80,0xd2, 0xc0,0x03,0x5f,0xd6]), 1);
+
+// 指令级替换: 原第一条指令被这 3 条顶替, 原第二条及以后保留
+addr.writest(new Uint8Array([
+    0x80,0x46,0x82,0x52,  // MOVZ W0, #0x1234
+    0xa0,0x79,0xb5,0x72,  // MOVK W0, #0xABCD, LSL #16
+    0xc0,0x03,0x5f,0xd6,  // RET
+]));
+
+// 写数据段: 先开写权限
+Memory.protect(dataAddr, 8, "rwx");
+dataAddr.writeU64(0xdeadbeefn);
+Memory.protect(dataAddr, 8, "r--");
+```
+
+**writest 细节**：patch 不带 RET/B 时末尾自动 fall-through 到 `addr+4`；`ADR/ADRP/BL/LDR literal/CBZ/TBZ/B.cond` 自动 relocate；patch 内部分支 ≤64 条指令有效；同地址重装需先 `unhook`。
+
+## Module
+
+| API | 参数 | 返回 |
+| --- | --- | --- |
+| `Module.findExportByName(module, symbol)` | `string, string` | `NativePointer \| null` |
+| `Module.findBaseAddress(module)` | `string` | `NativePointer \| null` |
+| `Module.findByAddress(addr)` | `AddressLike` | `ModuleInfo \| null` |
+| `Module.enumerateModules()` | — | `ModuleInfo[]` |
+| `Module.enumerateExports(name)` | `string` | `{type, name, address}[]` |
+| `Module.enumerateImports(name)` | `string` | `{type, name, slot, address}[]` |
+| `Module.enumerateSymbols(name)` | `string` | `{type, name, address, isGlobal, isDefined}[]` |
+| `Module.enumerateRanges(name, prot?)` | `string, "rwx" 风格` | `{base, size, protection, file:{path}}[]` |
+
+```js
+// 导出：defined + global/weak 符号
+Module.enumerateExports("libc.so").slice(0, 3);
+// [{type:"function", name:"__cxa_finalize", address:"0x7200f0e0a0"}, ...]
+
+// 按内存权限过滤 (prot 里 '-' 是通配, "r-x" 会匹配 r-x 和 rwx)
+Module.enumerateRanges("libc.so", "r-x");
+
+// 外部引用符号 + PLT/GOT slot 地址
+Module.enumerateImports("libart.so").filter(i => i.type === "function");
+```
+
+枚举的来源是模块的磁盘 ELF；memfd 或无文件支撑的合成模块返回空数组。
+
+## ptr / NativePointer
+
+```js
+var p = ptr("0x7f12345678");   // hex string / number / BigInt / NativePointer
+p.add(0x100).sub(0x10);        // 算术，返回新 NativePointer
+p.toString();                  // → "0x7f12345678"
+p.toInt();                     // → bigint (等价 toNumber)
+
+// Frida 兼容读写（完整 API 见上面 Memory 章节）
+p.readU32();                   // 等价 Memory.readU32(p)
+p.writeU64(0xdeadbeefn);       // 自动 mprotect
+p.readPointer().readCString(); // 链式解引用
+```
+
+| API | 参数 | 返回 |
 | --- | --- | --- |
 | `ptr(value)` | `number \| bigint \| string \| NativePointer` | `NativePointer` |
-| `p.add(offset)` | `number \| bigint \| "0x..." \| NativePointer` | `NativePointer` |
-| `p.sub(offset)` | `number \| bigint \| "0x..." \| NativePointer` | `NativePointer` |
-| `p.toString()` | 无 | `string` |
-| `p.toJSON()` | 无 | `string` |
-| `p.toNumber()` | 无 | `bigint` |
-| `p.toInt()` | 无 | `bigint` |
+| `p.add(offset)` / `p.sub(offset)` | `AddressLike` | `NativePointer` |
+| `p.toString()` / `p.toJSON()` | — | `string` (`"0x..."`) |
+| `p.toNumber()` / `p.toInt()` | — | `bigint` |
+| `p.readU8/U16/U32/U64/Pointer()` | — | `number \| bigint \| NativePointer` |
+| `p.readCString()` / `p.readUtf8String()` | — | `string` |
+| `p.readByteArray(len)` | `number` | `ArrayBuffer` |
+| `p.writeU8/U16/U32/U64/Pointer(val)` | 值 | `undefined` |
+| `p.writeBytes(bytes, stealth?)` | `ArrayBuffer\|TypedArray\|number[], 0\|1` | `undefined` |
+| `p.writest(bytes)` | `ArrayBuffer\|TypedArray\|number[]` (4B 倍数) | `undefined` |
 
-#### Memory
+所有读写方法的语义、错误处理、i-cache 约束与 `Memory.*` 完全一致；`writeBytes` / `writest` 的行为见 Memory 章节的表格。
 
-| API | 参数类型 | 返回类型 |
+## console
+
+`console.log(...)` / `console.info(...)` / `console.warn(...)` / `console.error(...)` / `console.debug(...)`
+
+## QBDI Trace
+
+| API | 参数 | 返回 |
 | --- | --- | --- |
-| `Memory.readU8(addr)` | `AddressLike` | `number` |
-| `Memory.readU16(addr)` | `AddressLike` | `number` |
-| `Memory.readU32(addr)` | `AddressLike` | `bigint` |
-| `Memory.readU64(addr)` | `AddressLike` | `bigint` |
-| `Memory.readPointer(addr)` | `AddressLike` | `NativePointer` |
-| `Memory.readCString(addr)` | `AddressLike` | `string` |
-| `Memory.readUtf8String(addr)` | `AddressLike` | `string` |
-| `Memory.readByteArray(addr, len)` | `AddressLike, number` | `ArrayBuffer` |
-| `Memory.writeU8(addr, value)` | `AddressLike, number` | `undefined` |
-| `Memory.writeU16(addr, value)` | `AddressLike, number` | `undefined` |
-| `Memory.writeU32(addr, value)` | `AddressLike, number` | `undefined` |
-| `Memory.writeU64(addr, value)` | `AddressLike, bigint \| number` | `undefined` |
-| `Memory.writePointer(addr, value)` | `AddressLike, AddressLike` | `undefined` |
-
-#### Module
-
-| API | 参数类型 | 返回类型 |
-| --- | --- | --- |
-| `Module.findExportByName(moduleName, symbolName)` | `string \| null, string` | `NativePointer \| null` |
-| `Module.findBaseAddress(moduleName)` | `string` | `NativePointer \| null` |
-| `Module.findByAddress(addr)` | `AddressLike` | `ModuleInfo \| null` |
-| `Module.enumerateModules()` | 无 | `ModuleInfo[]` |
-
-#### Native hook
-
-| API | 参数类型 | 返回类型 |
-| --- | --- | --- |
-| `hook(target, callback, stealth?)` | `AddressLike, (ctx: NativeHookContext) => any, boolean?` | `boolean` |
-| `unhook(target)` | `AddressLike` | `boolean` |
-| `callNative(func, ...args)` | `AddressLike, up to 6 x (number \| bigint \| NativePointer)` | `number \| bigint` |
-
-#### qbdi
-
-| API | 参数类型 | 返回类型 |
-| --- | --- | --- |
-| `qbdi.newVM()` | 无 | `number` |
+| `qbdi.newVM()` | — | `number` |
 | `qbdi.destroyVM(vm)` | `number` | `boolean` |
 | `qbdi.addInstrumentedModuleFromAddr(vm, addr)` | `number, AddressLike` | `boolean` |
 | `qbdi.addInstrumentedRange(vm, start, end)` | `number, AddressLike, AddressLike` | `boolean` |
 | `qbdi.removeInstrumentedRange(vm, start, end)` | `number, AddressLike, AddressLike` | `boolean` |
 | `qbdi.removeAllInstrumentedRanges(vm)` | `number` | `boolean` |
 | `qbdi.allocateVirtualStack(vm, size)` | `number, number` | `boolean` |
-| `qbdi.clearVirtualStacks(vm)` | `number` | `boolean` |
-| `qbdi.simulateCall(vm, returnAddr, ...args)` | `number, AddressLike, ...AddressLike[]` | `boolean` |
-| `qbdi.call(vm, target, ...args)` | `number, AddressLike, ...AddressLike[]` | `NativePointer \| null` |
+| `qbdi.simulateCall(vm, retAddr, ...args)` | `number, AddressLike, ...AddressLike` | `boolean` |
+| `qbdi.call(vm, target, ...args)` | `number, AddressLike, ...AddressLike` | `NativePointer \| null` |
 | `qbdi.run(vm, start, stop)` | `number, AddressLike, AddressLike` | `boolean` |
 | `qbdi.getGPR(vm, reg)` | `number, number` | `NativePointer` |
 | `qbdi.setGPR(vm, reg, value)` | `number, number, AddressLike` | `boolean` |
-| `qbdi.getErrno(vm)` | `number` | `number` |
-| `qbdi.setErrno(vm, value)` | `number, number` | `boolean` |
-| `qbdi.recordMemoryAccess(vm, accessType)` | `number, number` | `boolean` |
-| `qbdi.registerTraceCallbacks(vm, target, outputDir?)` | `number, AddressLike, string?` | `boolean` |
+| `qbdi.registerTraceCallbacks(vm, target, outDir?)` | `number, AddressLike, string?` | `boolean` |
 | `qbdi.unregisterTraceCallbacks(vm)` | `number` | `boolean` |
-| `qbdi.lastError()` | 无 | `string` |
-| `qbdi.shutdown()` | 无 | `undefined` |
+| `qbdi.lastError()` | — | `string` |
 
-补充说明：
-
-- `vm` 是 `qbdi.newVM()` 返回的句柄，不是 JS 对象。
-- 常用寄存器常量包括：
-  - `qbdi.REG_RETURN`
-  - `qbdi.REG_BP`
-  - `qbdi.REG_LR`
-  - `qbdi.REG_SP`
-  - `qbdi.REG_FLAG`
-  - `qbdi.REG_PC`
-- 常见最小流程：
+常用寄存器常量：`qbdi.REG_RETURN`, `qbdi.REG_SP`, `qbdi.REG_LR`, `qbdi.REG_PC`
 
 ```js
 var vm = qbdi.newVM();
 qbdi.addInstrumentedModuleFromAddr(vm, target);
 qbdi.allocateVirtualStack(vm, 0x100000);
 qbdi.simulateCall(vm, 0, arg0, arg1);
+qbdi.registerTraceCallbacks(vm, target);
 qbdi.run(vm, target, 0);
 var ret = qbdi.getGPR(vm, qbdi.REG_RETURN);
+qbdi.unregisterTraceCallbacks(vm);
 qbdi.destroyVM(vm);
 ```
 
-#### Java
+Trace 文件默认输出到 `/data/data/<package>/trace_bundle.pb`，配合 qbdi-replay + IDA 插件回放。
 
-| API | 参数类型 | 返回类型 |
-| --- | --- | --- |
-| `Java.use(className)` | `string` | `JavaClassWrapper` |
-| `Class.$new(...args)` | 任意，运行时按重载解析 | `JavaObjectProxy` |
-| `Class.method(...args)` | 任意，运行时按重载解析 | `any` |
-| `Class.method.overload(...types)` | `string...` 或 `string[]...` | `MethodWrapper` |
-| `Class.method.impl = fn` | `(ctx: JavaHookContext) => any` | setter，无返回值 |
-| `Class.method.impl = null` | `null` | setter，无返回值 |
-| `Java.ready(fn)` | `() => void` | `void` |
-| `Java.deopt()` | 无 | `boolean` |
-| `Java.setStealth(enabled)` | `boolean` | `boolean` |
-| `Java.getStealth()` | 无 | `boolean` |
-| `Java.getField(objPtr, className, fieldName, fieldSig)` | `AddressLike, string, string, string` | `any` |
+---
 
-#### Jni
+## 注意事项
 
-| API | 参数类型 | 返回类型 |
-| --- | --- | --- |
-| `Jni.addr(name)` | `string` | `NativePointer` |
-| `Jni.addr(env, name)` | `AddressLike, string` | `NativePointer` |
-| `Jni.find(name)` | `string` | `JniEntry` |
-| `Jni.find(env, name)` | `AddressLike, string` | `JniEntry` |
-| `Jni.entries()` | 无 | `JniEntry[]` |
-| `Jni.entries(env)` | `AddressLike` | `JniEntry[]` |
-| `Jni.table` | 无 | `Record<string, JniEntry>` |
-| `Jni.FindClass` | 无 | `NativePointer` |
-| `Jni.helper.env.ptr` | 无 | `NativePointer` |
-| `Jni.helper.env.getObjectClass(obj)` | `AddressLike` | `NativePointer` |
-| `Jni.helper.env.getSuperclass(clazz)` | `AddressLike` | `NativePointer` |
-| `Jni.helper.env.isSameObject(a, b)` | `AddressLike, AddressLike` | `boolean` |
-| `Jni.helper.env.isInstanceOf(obj, clazz)` | `AddressLike, AddressLike` | `boolean` |
-| `Jni.helper.env.exceptionCheck()` | 无 | `boolean` |
-| `Jni.helper.env.exceptionOccurred()` | 无 | `NativePointer` |
-| `Jni.helper.env.exceptionClear()` | 无 | `boolean` |
-| `Jni.helper.env.readJString(jstr)` | `AddressLike` | `string \| null` |
-| `Jni.helper.env.getClassName(clazz)` | `AddressLike` | `string \| null` |
-| `Jni.helper.env.getObjectClassName(obj)` | `AddressLike` | `string \| null` |
-| `Jni.helper.structs.JNINativeMethod.read(addr)` | `AddressLike` | `JNINativeMethodInfo` |
-| `Jni.helper.structs.JNINativeMethod.readArray(addr, count)` | `AddressLike, number` | `JNINativeMethodInfo[]` |
-| `Jni.helper.structs.jvalue.read(addr, jniType)` | `AddressLike, string` | `any` |
-| `Jni.helper.structs.jvalue.readArray(addr, typesOrSig)` | `AddressLike, string \| string[]` | `any[]` |
+- **两种 hook 都建议 `return ctx.orig()`** 透传返回值
+- **Native hook 改参数/返回值：** `ctx.x0 = value` 或 `ctx.orig(newArg0, newArg1)`，`return value` 覆盖返回值
+- **Java hook 改参数/返回值：** `return ctx.orig(newArgs)` 改参数，`return value` 改返回值
+- **Java 字段访问必须用 `.value`：** `obj.field` 返回 FieldWrapper，`obj.field.value` 才是真实值
+- **`Java.choose` 的 wrapper 仅在 `onMatch` 内有效**，跨回调保留需要自己提取字段值
+- Spawn 模式下 Java hook 必须放在 `Java.ready(fn)` 里（`Java.classLoaders()` / `Java.choose` 同理）
+- `Java.setStealth()` 必须在 `Java.use().impl` 之前调用
+- `callNative()` 仅支持整数/指针参数（最多 6 个），需要浮点/任意签名用 `NativeFunction`
+- 自修改代码后需 `Memory.flushCodeCache(addr, size)` 清 I-cache
 
-### 3.3 结构体 / 上下文对象速查
+---
 
-#### ModuleInfo
+## 免责声明
 
-```ts
-type ModuleInfo = {
-  name: string
-  base: NativePointer
-  size: number
-  path: string
-}
-```
-
-#### NativeHookContext
-
-```ts
-type NativeHookContext = {
-  x0: number | bigint
-  x1: number | bigint
-  x2: number | bigint
-  x3: number | bigint
-  x4: number | bigint
-  x5: number | bigint
-  x6: number | bigint
-  x7: number | bigint
-  x8: number | bigint
-  x9: number | bigint
-  x10: number | bigint
-  x11: number | bigint
-  x12: number | bigint
-  x13: number | bigint
-  x14: number | bigint
-  x15: number | bigint
-  x16: number | bigint
-  x17: number | bigint
-  x18: number | bigint
-  x19: number | bigint
-  x20: number | bigint
-  x21: number | bigint
-  x22: number | bigint
-  x23: number | bigint
-  x24: number | bigint
-  x25: number | bigint
-  x26: number | bigint
-  x27: number | bigint
-  x28: number | bigint
-  x29: number | bigint
-  x30: number | bigint
-  sp: number | bigint
-  pc: number | bigint
-  trampoline: number | bigint
-  orig(): number | bigint
-}
-```
-
-说明：
-
-- native hook 改返回值时，修改的是 `ctx.x0`
-- `ctx.orig()` 会调用原函数并同步写回 `ctx.x0`
-
-#### JavaHookContext
-
-```ts
-type JavaHookContext = {
-  thisObj?: JavaObjectProxy
-  args: any[]
-  env: number | bigint
-  orig(...args: any[]): any
-}
-```
-
-说明：
-
-- `thisObj` 仅实例方法存在，静态方法没有
-- Java hook 的 `return` 值就是方法返回值
-- `ctx.orig()` 不传参时使用原始参数；传参时用新参数调用原方法
-
-#### JniEntry
-
-```ts
-type JniEntry = {
-  name: string
-  index: number
-  address: NativePointer
-}
-```
-
-#### JNINativeMethodInfo
-
-```ts
-type JNINativeMethodInfo = {
-  address: NativePointer
-  namePtr: NativePointer
-  sigPtr: NativePointer
-  fnPtr: NativePointer
-  name: string | null
-  sig: string | null
-}
-```
-
-## 4. console
-
-支持：
-
-```javascript
-console.log(...)
-console.info(...)
-console.warn(...)
-console.error(...)
-console.debug(...)
-```
-
-示例：
-
-```javascript
-console.log("base =", Module.findBaseAddress("libart.so"))
-```
-
-## 5. ptr 和 NativePointer
-
-### 4.1 创建指针
-
-`ptr(value)` 支持：
-
-- 数字
-- `BigInt`
-- 十六进制字符串，如 `"0x7f12345678"`
-- 已经是 `NativePointer` 的对象
-
-示例：
-
-```javascript
-var p = ptr("0x7f12345678")
-console.log(p.toString())   // 0x7f12345678
-```
-
-### 4.2 NativePointer 方法
-
-- `p.add(offset)`
-- `p.sub(offset)`
-- `p.toString()`
-- `p.toJSON()`
-- `p.toNumber()`
-- `p.toInt()`
-
-说明：
-
-- `offset` 可以是数字、`BigInt`、`0x...` 字符串或另一个 `NativePointer`
-- `toNumber()` / `toInt()` 返回 `BigInt`
-
-示例：
-
-```javascript
-var base = Module.findBaseAddress("libart.so")
-var target = base.add(0x1234)
-console.log(target.toString())
-```
-
-## 6. Memory
-
-### 5.1 读取
-
-- `Memory.readU8(ptr)`
-- `Memory.readU16(ptr)`
-- `Memory.readU32(ptr)`
-- `Memory.readU64(ptr)`
-- `Memory.readPointer(ptr)`
-- `Memory.readCString(ptr)`
-- `Memory.readUtf8String(ptr)`
-- `Memory.readByteArray(ptr, length)`
-
-说明：
-
-- 无效地址会抛 `RangeError`，不会直接崩进程
-- `readCString()` 最多读取 `4096` 字节
-- `readByteArray()` 返回 `ArrayBuffer`
-- `readPointer()` 返回 `NativePointer`
-- `readU32()` / `readU64()` 返回 `BigInt`
-
-示例：
-
-```javascript
-var sym = Module.findExportByName("libc.so", "dlopen")
-console.log(Memory.readPointer(sym).toString())
-```
-
-### 5.2 写入
-
-- `Memory.writeU8(ptr, value)`
-- `Memory.writeU16(ptr, value)`
-- `Memory.writeU32(ptr, value)`
-- `Memory.writeU64(ptr, value)`
-- `Memory.writePointer(ptr, value)`
-
-说明：
-
-- 写入前会检查地址可访问性
-- 必要时内部会临时尝试修改页面权限
-- 成功时返回 `undefined`
-
-示例：
-
-```javascript
-var p = ptr("0x12345678")
-Memory.writeU32(p, 0x90909090)
-```
-
-## 7. Module
-
-支持：
-
-- `Module.findExportByName(moduleName, symbolName)`
-- `Module.findBaseAddress(moduleName)`
-- `Module.findByAddress(address)`
-- `Module.enumerateModules()`
-
-返回值：
-
-- `findExportByName()` / `findBaseAddress()` 找不到时返回 `null`
-- `findByAddress()` 找不到时返回 `null`
-- `enumerateModules()` 返回：
-
-```javascript
-[
-  {
-    name: "libart.so",
-    base: ptr("0x7f..."),
-    size: 123456,
-    path: "/apex/..."
-  }
-]
-```
-
-示例：
-
-```javascript
-var art = Module.findBaseAddress("libart.so")
-var info = Module.findByAddress(art)
-console.log(JSON.stringify(info))
-```
-
-## 8. Native Hook API
-
-### 7.1 安装和移除 hook
-
-- `hook(target, callback[, stealth])`
-- `unhook(target)`
-
-参数说明：
-
-- `target` 必须是地址，可传 `NativePointer`、数字、`BigInt` 或十六进制字符串
-- `callback` 必须是 JS 函数
-- `stealth` 是可选布尔值，`true` 时优先使用 stealth 模式安装 inline hook
-
-示例：
-
-```javascript
-var openPtr = Module.findExportByName("libc.so", "open")
-
-hook(openPtr, function(ctx) {
-  console.log("open called, x0 =", ptr(ctx.x0).toString())
-  ctx.orig()
-})
-```
-
-### 7.2 native hook 回调上下文
-
-native hook 的 `ctx` 里可用：
-
-- `ctx.x0` ~ `ctx.x30`
-- `ctx.sp`
-- `ctx.pc`
-- `ctx.trampoline`
-- `ctx.orig()`
-
-关键行为：
-
-- `ctx.orig()` 会调用原函数，并把返回值写回 `ctx.x0`
-- native hook 的 JS `return` 值本身不会作为返回值使用
-- 如果你想改返回值，要显式修改 `ctx.x0`
-
-改返回值示例：
-
-```javascript
-hook(Module.findExportByName("libc.so", "getpid"), function(ctx) {
-  ctx.orig()
-  ctx.x0 = 12345
-})
-```
-
-### 7.3 直接调用 native 函数
-
-签名：
-
-```javascript
-callNative(funcPtr, arg0?, arg1?, arg2?, arg3?, arg4?, arg5?)
-```
-
-说明：
-
-- 最多传 6 个参数，按 `ARM64 x0 ~ x5` 传入
-- 适合整数/指针参数
-- 返回值会自动转成 `number` 或 `BigInt`
-
-示例：
-
-```javascript
-var getpidPtr = Module.findExportByName("libc.so", "getpid")
-console.log(callNative(getpidPtr))
-```
-
-## 9. Java API
-
-`Java` 提供的是偏 Frida 风格的接口，但实现细节以当前仓库代码为准。
-
-### 8.1 Java.use
-
-```javascript
-var Activity = Java.use("android.app.Activity")
-```
-
-类包装对象支持：
-
-- `Class.$new(...args)` 创建对象
-- `Class.method(...args)` 调用静态方法
-- `Class.method.overload(...)` 指定重载
-- `Class.method.impl = function(ctx) { ... }` 安装 hook
-- `Class.method.impl = null` 卸载 hook
-
-实例对象支持：
-
-- `obj.fieldName` 直接读字段
-- `obj.method(...args)` 调实例方法
-- `obj.$call(name, sig, ...args)` 按显式签名调用
-- `obj.$className`
-
-示例：
-
-```javascript
-var Process = Java.use("android.os.Process")
-console.log(Process.myPid())
-
-var JString = Java.use("java.lang.String")
-var s = JString.$new("hello")
-console.log(s.length())
-```
-
-### 8.2 overload 用法
-
-支持三种写法：
-
-```javascript
-Activity.onResume.overload("int")
-Activity.onResume.overload("(I)V")
-SomeClass.foo.overload(["int", "java.lang.String"], ["long"])
-```
-
-说明：
-
-- 传 Java 类型名时，会自动转 JNI 签名
-- 传 JNI 签名时必须是 `"(...)..."` 形式
-- 传多个数组时，可一次选择多个 overload 进行 hook
-
-### 8.3 Java hook 回调
-
-Java hook 的回调上下文 `ctx` 里常用字段：
-
-- `ctx.thisObj`
-- `ctx.args`
-- `ctx.env`
-- `ctx.orig()`
-
-关键行为：
-
-- Java hook 的 `return` 值会作为方法返回值
-- `ctx.orig()` 可调用原方法
-- `ctx.thisObj` 和 `ctx.args` 里的 Java 对象会自动包装成可直接访问的代理对象
-
-示例：
-
-```javascript
-var Activity = Java.use("android.app.Activity")
-
-Activity.onResume.impl = function(ctx) {
-  console.log("Activity.onResume:", ctx.thisObj.$className)
-  return ctx.orig()
-}
-```
-
-修改参数再调用原方法：
-
-```javascript
-var JString = Java.use("java.lang.String")
-var Demo = Java.use("com.example.demo.MainActivity")
-
-Demo.test.overload("java.lang.String").impl = function(ctx) {
-  return ctx.orig(JString.$new("patched"))
-}
-```
-
-### 8.4 Java.ready
-
-`spawn` 模式下注入过早时，应用 `ClassLoader` 还没准备好。此时建议：
-
-```javascript
-Java.ready(function() {
-  var Main = Java.use("com.example.app.MainActivity")
-  Main.onResume.impl = function(ctx) {
-    console.log("ready hook hit")
-    return ctx.orig()
-  }
-})
-```
-
-如果已经是 attach 到运行中的进程，`Java.ready(fn)` 会立即执行。
-
-### 8.5 其他 Java API
-
-- `Java.deopt()`
-  - 尝试清空 JIT 缓存。
-- `Java.setStealth(true | false)`
-  - 设置 Java hook 使用 stealth 模式。
-- `Java.getStealth()`
-  - 查看当前 stealth 开关。
-- `Java.getField(objPtr, className, fieldName, fieldSig)`
-  - 通过原始对象指针读字段。
-
-`Java.getField()` 示例：
-
-```javascript
-var objPtr = ptr("0x12345678")
-var value = Java.getField(objPtr, "com.example.Test", "mCount", "I")
-console.log(value)
-```
-
-## 10. Jni API
-
-`Jni` 主要用于定位 JNI 函数地址，以及辅助解析 `JNIEnv`、`jvalue`、`JNINativeMethod`。
-
-### 9.1 直接取 JNI 函数地址
-
-下面几种写法都可以：
-
-```javascript
-Jni.FindClass
-Jni.addr("FindClass")
-Jni.find("FindClass")
-Jni.table.FindClass
-```
-
-如果需要指定某个 `JNIEnv*`：
-
-```javascript
-Jni.addr(envPtr, "FindClass")
-Jni.find(envPtr, "FindClass")
-Jni.entries(envPtr)
-```
-
-说明：
-
-- `Jni.FindClass` / `Jni.RegisterNatives` 这类属性值是函数地址
-- `Jni.find(...)` 返回 `{ name, index, address }`
-- `Jni.entries(...)` 返回整个 JNI 表数组
-- `Jni.table` 返回按名字索引的整张表
-
-### 9.2 Jni.helper
-
-常用辅助：
-
-- `Jni.helper.pointerSize`
-- `Jni.helper.env.ptr`
-- `Jni.helper.env.getObjectClass(obj)`
-- `Jni.helper.env.getSuperclass(clazz)`
-- `Jni.helper.env.isSameObject(a, b)`
-- `Jni.helper.env.isInstanceOf(obj, clazz)`
-- `Jni.helper.env.exceptionCheck()`
-- `Jni.helper.env.exceptionOccurred()`
-- `Jni.helper.env.exceptionClear()`
-- `Jni.helper.env.readJString(jstr)`
-- `Jni.helper.env.getClassName(clazz)`
-- `Jni.helper.env.getObjectClassName(obj)`
-
-结构体辅助：
-
-- `Jni.helper.structs.JNINativeMethod.read(ptr)`
-- `Jni.helper.structs.JNINativeMethod.readArray(ptr, count)`
-- `Jni.helper.structs.jvalue.read(ptr, jniType)`
-- `Jni.helper.structs.jvalue.readArray(ptr, typesOrSig)`
-
-示例：读取 `RegisterNatives` 的方法表
-
-```javascript
-hook(Jni.addr("RegisterNatives"), function(ctx) {
-  var methods = Jni.helper.structs.JNINativeMethod.readArray(
-    ptr(ctx.x2),
-    Number(ctx.x3)
-  )
-  console.log(JSON.stringify(methods))
-  ctx.orig()
-})
-```
-
-示例：观察 `FindClass`
-
-```javascript
-hook(Jni.addr("FindClass"), function(ctx) {
-  console.log("FindClass:", Memory.readCString(ptr(ctx.x1)))
-  ctx.orig()
-})
-```
-
-## 11. 推荐示例
-
-### 10.1 hook libc 导出函数
-
-```javascript
-var dlopenPtr = Module.findExportByName("libdl.so", "dlopen")
-
-hook(dlopenPtr, function(ctx) {
-  console.log("dlopen:", Memory.readCString(ptr(ctx.x0)))
-  ctx.orig()
-})
-```
-
-### 10.2 hook Java 方法
-
-```javascript
-Java.ready(function() {
-  var Activity = Java.use("android.app.Activity")
-
-  Activity.onResume.impl = function(ctx) {
-    console.log("onResume hit")
-    return ctx.orig()
-  }
-})
-```
-
-### 10.3 调用 native 函数
-
-```javascript
-var getpidPtr = Module.findExportByName("libc.so", "getpid")
-console.log("pid =", callNative(getpidPtr))
-```
-
-## 12. 注意事项
-
-- native hook 和 Java hook 的返回语义不同：
-  - native hook 需要改 `ctx.x0`
-  - Java hook 直接 `return` 即可
-- `callNative()` 当前主要面向整数/指针参数，不适合复杂 ABI 封送
-- `Java.ready()` 主要解决 spawn 场景下 app `ClassLoader` 尚未就绪的问题
-- 需要稳定 hook Java 层时，优先先 `Java.ready(...)` 再 `Java.use(...)`
+本项目仅供安全研究、逆向工程学习和授权测试用途。使用者应确保在合法授权范围内使用本工具，遵守所在地区的法律法规。作者不对任何滥用、非法使用或由此造成的损失承担责任。使用本项目即表示您同意自行承担所有风险。

@@ -67,11 +67,23 @@ typedef struct HookRedirectEntry {
     struct HookRedirectEntry* next; /* Next entry in list */
 } HookRedirectEntry;
 
+/* 可执行内存 pool（多个，按需靠近 hook 目标分配） */
+#define MAX_EXEC_POOLS 64
+#define EXEC_POOL_SIZE (64 * 1024)  /* 每个 pool 64KB */
+
+typedef struct {
+    void* base;
+    size_t size;
+    size_t used;
+} ExecPool;
+
 /* Global hook engine state */
 typedef struct {
-    void* exec_mem;                 /* Executable memory pool */
-    size_t exec_mem_size;           /* Total pool size */
-    size_t exec_mem_used;           /* Used bytes */
+    void* exec_mem;                 /* 初始 pool（向后兼容） */
+    size_t exec_mem_size;           /* 初始 pool 总大小 */
+    size_t exec_mem_used;           /* 初始 pool 已用 */
+    ExecPool pools[MAX_EXEC_POOLS]; /* 多 pool（含初始 pool） */
+    int pool_count;                 /* 已分配 pool 数 */
     HookEntry* hooks;               /* Linked list of hooks */
     HookEntry* free_list;           /* Freed entries for reuse */
     HookRedirectEntry* redirects;   /* Linked list of redirect hooks */
@@ -140,7 +152,35 @@ void hook_engine_cleanup(void);
  * @param size          Number of bytes to allocate
  * @return              Pointer to allocated memory, NULL on failure
  */
+/* 注册外部分配的 RWX 内存为 ExecPool（供 hook_alloc_near_range 使用）。
+ * recomp 页在 mmap 时附带分配 hook slot 区，注册后 hook engine 可直接使用，
+ * 避免二次 near-range 分配失败。
+ * 返回 0 成功，-1 失败（pool 数量已满）。 */
+int hook_register_pool(void* base, size_t size);
+
+/* 重建 trampoline: 将 orig_bytes (4字节) 从 orig_pc 重定位到 trampoline，
+ * 然后追加绝对跳转到 jump_back_target。
+ * 用途: stealth2 slot 模式下修复 hook engine 自动生成的错误 trampoline。
+ * 返回 trampoline 写入的总字节数，<0 失败。 */
+int hook_rebuild_trampoline(void* trampoline, size_t trampoline_size,
+                            const void* orig_bytes, uint64_t orig_pc,
+                            void* jump_back_target);
+
+/* Allocate from any pool (legacy, no locality guarantee) */
 void* hook_alloc(size_t size);
+
+/* Allocate from a pool near `target` (within ±4GB for ADRP).
+ * Creates a new pool via maps gap scan if no existing pool is in range. */
+void* hook_alloc_near(size_t size, void* target);
+
+/* mmap RWX 内存，扫描 /proc/self/maps 在 target ±4GB 内找空隙。
+ * target=NULL 时退化为普通 mmap(NULL)。
+ * 返回 mmap 指针，MAP_FAILED 表示失败。调用方负责 munmap。 */
+void* hook_mmap_near(void* target, size_t alloc_size);
+
+/* 参数化版本: 指定搜索范围 max_range（如 ±128MB = 1<<27）。
+ * recomp 页用此确保紧邻原始代码。 */
+void* hook_mmap_near_range(void* target, size_t alloc_size, int64_t max_range);
 
 /*
  * Relocate ARM64 instruction(s) to dst.
@@ -231,7 +271,8 @@ void* hook_remove_redirect(uint64_t key);
  * @param user_data      User data passed to callback
  * @return               Thunk address (to store in ArtMethod.data_), NULL on failure
  */
-void* hook_create_native_trampoline(uint64_t key, HookCallback on_enter, void* user_data);
+void* hook_create_native_trampoline(uint64_t key, HookCallback on_enter, void* user_data,
+                                    uint64_t current_pc_hint);
 
 /*
  * ART router lookup table — inline C-side table for O(N) scan in generated thunk.
@@ -268,6 +309,13 @@ int hook_art_router_table_remove(uint64_t original);
 void hook_art_router_table_clear(void);
 
 /*
+ * Reverse lookup: given replacement ArtMethod*, return the original ArtMethod*.
+ * Used by callOriginal TLS bypass to match art_router entries.
+ * Returns 0 if not found.
+ */
+uint64_t hook_art_router_table_lookup_original(uint64_t replacement);
+
+/*
  * Dump all entries in the ART router lookup table (via hook_log).
  */
 void hook_art_router_table_dump(void);
@@ -288,6 +336,11 @@ void hook_dump_code(void* addr, size_t size);
  * The ART router thunk stores X0 to a global on every not_found scan.
  */
 void hook_art_router_get_debug(uint64_t* last_x0, uint64_t* miss_count);
+
+/*
+ * Get hit counter for found path + last matched X0.
+ */
+void hook_art_router_get_hit_debug(uint64_t* hit_count, uint64_t* last_hit_x0);
 
 /*
  * Debug: reset the not_found X0 capture and miss counter.
@@ -311,11 +364,20 @@ void hook_art_router_reset_debug(void);
  * @param jni_env           JNIEnv* for resolving tiny ART trampolines
  * @param out_hooked_target If non-NULL, receives the actual hooked address (may differ
  *                          from target if resolve_art_trampoline resolved a tiny trampoline)
+ * @param skip_resolve      1 to skip resolve_art_trampoline (caller already resolved)
  * @return                  Trampoline address (relocated original instructions), NULL on failure
  */
 void* hook_install_art_router(void* target, uint32_t quickcode_offset,
                                int stealth, void* jni_env,
-                               void** out_hooked_target);
+                               void** out_hooked_target,
+                               int skip_resolve,
+                               uint64_t current_pc_hint);
+
+/*
+ * Resolve tiny ART trampolines (LDR Xt,[X19,#imm]; BR Xt) to actual target.
+ * Returns the resolved address, or target unchanged if not a trampoline.
+ */
+void* resolve_art_trampoline(void* target, void* jni_env);
 
 /*
  * Create a standalone ART method router stub (no inline patching).
@@ -341,6 +403,14 @@ void* hook_install_art_router(void* target, uint32_t quickcode_offset,
  */
 void* hook_create_art_router_stub(uint64_t fallback_target,
                                    uint32_t quickcode_offset);
+
+/* C-side GC synchronization — 对标 Frida synchronize_replacement_methods.
+ * 遍历 router table 同步 declaring_class_ + nterp 降级。
+ * 由 Rust 侧 GC 回调调用。 */
+void hook_art_synchronize_replacement_methods(
+    uint32_t quickcode_offset,
+    uint64_t nterp_entrypoint,
+    uint64_t interp_bridge);
 
 /*
  * Install a replace-mode hook (save ctx → callback → restore x0 → RET)
@@ -368,6 +438,64 @@ void* hook_replace(void* target, HookCallback on_enter, void* user_data, int ste
  * @return              x0 result from the original function
  */
 uint64_t hook_invoke_trampoline(HookContext* ctx, void* trampoline);
+
+/*
+ * Patch inlined GetOatQuickMethodHeader copies in WalkStack (API 31+).
+ *
+ * Scans libart.so executable segments for the inlined pattern and binary-patches
+ * each copy with a trampoline that checks if the method is a replacement (via
+ * g_art_router_table). Replacement methods skip the OAT lookup to prevent
+ * NULL+0x18 SIGSEGV in WalkStack.
+ *
+ * @return  Number of patterns patched (>=0), or negative error code
+ */
+int hook_patch_inlined_oat_header_checks(void);
+
+/*
+ * Restore all inlined OAT header patches applied by hook_patch_inlined_oat_header_checks().
+ *
+ * @return  Number of patches restored
+ */
+int hook_restore_inlined_oat_header_patches(void);
+
+/*
+ * Recomp translate callback: 将原始地址翻译为 recomp 页地址。
+ * 返回 recomp 地址 (>0) 表示成功，0 表示失败。
+ */
+typedef uintptr_t (*recomp_translate_fn)(uintptr_t orig_addr);
+
+/*
+ * 注册 recomp 翻译回调。设置后，oat_patch 等写入会在 recomp 页上操作。
+ */
+void hook_set_recomp_translate(recomp_translate_fn fn);
+
+/*
+ * 设置 OAT patch 的 stealth 模式: 0=normal(mprotect), 1=wxshadow, 2=recomp
+ * hook_set_recomp_translate 会自动设为 2，此函数用于单独设 wxshadow。
+ */
+void hook_set_stealth_mode(int mode);
+
+/*
+ * Stealth-write `len` bytes of `buf` to `addr` via the kernel wxshadow
+ * facility. Creates a shadow page, writes the bytes, and activates it as
+ * --x without ever exposing the target page as writable in /proc/self/maps.
+ * Returns 0 on success, HOOK_ERROR_WXSHADOW_FAILED on failure (kernel does
+ * not support wxshadow, target VMA is not 4KB-mapped after PMD-split COW
+ * retry, etc.).
+ */
+int wxshadow_patch(void* addr, const void* buf, size_t len);
+
+/*
+ * Release a wxshadow patch by its exact patch start address (must match the
+ * `addr` previously passed to wxshadow_patch). Returns 0 on success.
+ */
+int wxshadow_release(void* addr);
+
+/*
+ * Diagnostic: 测试 hook_alloc_near 对给定 target 的有效性。
+ * 打印 pool 状态、分配结果、ADRP 可达性。
+ */
+void hook_diag_alloc_near(void* target);
 
 #ifdef __cplusplus
 }

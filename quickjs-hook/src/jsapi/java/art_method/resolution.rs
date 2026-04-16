@@ -71,7 +71,7 @@ pub(super) fn resolve_art_method(
             let get_method_id: GetMethodIdFn = jni_fn!(env, GetMethodIdFn, JNI_GET_METHOD_ID);
 
             let method_id = get_method_id(env, cls, c_method.as_ptr(), c_sig.as_ptr());
-            output_message(&format!(
+            output_verbose(&format!(
                 "[resolve_art_method] cls={:#x}, GetMethodID({}.{}{})={:#x}",
                 cls as u64, class_name, method_name, signature, method_id as u64
             ));

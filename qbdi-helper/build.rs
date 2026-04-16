@@ -3,9 +3,8 @@ fn main() {
         .file("../agent/src/hide_soinfo.c")
         .compile("hide_soinfo");
 
-    let manifest_dir = std::path::PathBuf::from(
-        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"),
-    );
+    let manifest_dir =
+        std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));
     let workspace_root = manifest_dir
         .parent()
         .expect("qbdi-helper must live under the workspace root");

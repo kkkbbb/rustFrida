@@ -63,15 +63,7 @@ fn parse_maps_line(line: &str) -> Option<(u64, u64, String, u64, String, u64, St
         String::new()
     };
 
-    Some((
-        start_addr,
-        end_addr,
-        permissions,
-        offset,
-        dev,
-        inode,
-        pathname,
-    ))
+    Some((start_addr, end_addr, permissions, offset, dev, inode, pathname))
 }
 
 const MEMORY_CHUNK_SIZE: usize = 4 * 1024 * 1024;
@@ -118,9 +110,7 @@ fn write_memory_region_chunked<W: Write>(
         let mut region_buf = Vec::with_capacity(chunk_size + 256);
         region
             .encode_length_delimited(&mut region_buf)
-            .map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::Other, format!("Region 编码失败: {}", e))
-            })?;
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Region 编码失败: {}", e)))?;
         output.write_all(&region_buf)?;
 
         current_addr = chunk_end;
@@ -140,22 +130,11 @@ pub(crate) fn dump_memory_snapshot(output_path: &str) -> std::io::Result<()> {
     let mut regions_to_dump: Vec<(u64, u64, String, u64, String, u64, String)> = Vec::new();
     for line in reader.lines() {
         let line = line?;
-        if let Some((start_addr, end_addr, permissions, offset, dev, inode, pathname)) =
-            parse_maps_line(&line)
-        {
-            if ((pathname.contains(".so") && pathname.contains("/data"))
-                || pathname.contains("base.apk"))
+        if let Some((start_addr, end_addr, permissions, offset, dev, inode, pathname)) = parse_maps_line(&line) {
+            if ((pathname.contains(".so") && pathname.contains("/data")) || pathname.contains("base.apk"))
                 && permissions.contains('r')
             {
-                regions_to_dump.push((
-                    start_addr,
-                    end_addr,
-                    permissions,
-                    offset,
-                    dev,
-                    inode,
-                    pathname,
-                ));
+                regions_to_dump.push((start_addr, end_addr, permissions, offset, dev, inode, pathname));
             }
         }
     }
@@ -181,24 +160,14 @@ pub(crate) fn dump_memory_snapshot(output_path: &str) -> std::io::Result<()> {
     let mut header_buf = Vec::new();
     header
         .encode_length_delimited(&mut header_buf)
-        .map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, format!("Header 编码失败: {}", e))
-        })?;
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Header 编码失败: {}", e)))?;
     output_file.write_all(&header_buf)?;
 
     for (start_addr, end_addr, permissions, offset, _dev, _inode, pathname) in regions_to_dump {
-        if let Err(e) = write_memory_region_chunked(
-            &mut output_file,
-            start_addr,
-            end_addr,
-            &permissions,
-            offset,
-            &pathname,
-        ) {
-            log_msg(format!(
-                "写入内存区域失败 0x{:x}-0x{:x}: {}",
-                start_addr, end_addr, e
-            ));
+        if let Err(e) =
+            write_memory_region_chunked(&mut output_file, start_addr, end_addr, &permissions, offset, &pathname)
+        {
+            log_msg(format!("写入内存区域失败 0x{:x}-0x{:x}: {}", start_addr, end_addr, e));
             continue;
         }
     }

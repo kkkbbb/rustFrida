@@ -175,11 +175,7 @@ fn parse_indirect_branch(instr: u32, regs: &UserRegs) -> Option<Arm64BranchType>
         }
         RET_OPCODE => {
             let rn = ((instr >> 5) & 0x1F) as usize;
-            let target = if rn == 31 {
-                regs.regs[30]
-            } else {
-                regs.regs[rn]
-            };
+            let target = if rn == 31 { regs.regs[30] } else { regs.regs[rn] };
             Some(Arm64BranchType::IndirectBranch { target })
         }
         _ => None,

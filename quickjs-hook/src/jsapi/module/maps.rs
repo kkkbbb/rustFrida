@@ -3,9 +3,12 @@
 // ============================================================================
 
 /// Parse /proc/self/maps to find the libart.so address range and file path.
+///
+/// 只识别系统 ART：basename 精确为 `libart.so` 且落在系统路径白名单
+/// (`/apex/`、`/system/`、`/system_ext/`)，避免命中 APK 打包的同名伪装文件。
 pub(crate) fn probe_libart_range() -> (u64, u64) {
     let snapshot = ModuleSnapshot::load_current();
-    let summary = snapshot.summarize_matching_paths(|path| path.contains("libart.so"));
+    let summary = snapshot.summarize_matching_paths(is_system_libart_path);
     let found_path = summary.as_ref().map(|summary| summary.first_path.clone());
 
     let _ = LIBART_PATH.set(found_path.clone());
@@ -29,6 +32,31 @@ pub(crate) fn probe_module_range(module_name: &str) -> (u64, u64) {
         .summarize_matching_paths(|path| matches_exact_module_name(path, module_name))
         .map(|summary| (summary.base, summary.end))
         .unwrap_or((0, 0))
+}
+
+/// Find a loaded module's file path and base address by name.
+/// Returns `None` if not found. Used by `module_dlsym` for direct ELF parsing.
+fn find_module_path_and_base(module_name: &str) -> Option<(String, u64)> {
+    {
+        let guard = module_cache()
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(info) = guard
+            .snapshot
+            .modules
+            .iter()
+            .find(|m| matches_module_lookup_name(&m.path, module_name))
+        {
+            return Some((info.path.clone(), info.base));
+        }
+    }
+
+    let snapshot = refresh_module_snapshot_cache();
+    snapshot
+        .modules
+        .iter()
+        .find(|m| matches_module_lookup_name(&m.path, module_name))
+        .map(|info| (info.path.clone(), info.base))
 }
 
 /// Parse /proc/self/maps to find a module's base address.
@@ -384,6 +412,16 @@ fn module_basename(path: &str) -> &str {
 
 fn matches_exact_module_name(path: &str, module_name: &str) -> bool {
     path.contains(module_name) && module_basename(path) == module_name
+}
+
+/// 系统 libart.so 路径白名单：basename 精确匹配 + 系统目录前缀。
+fn is_system_libart_path(path: &str) -> bool {
+    if module_basename(path) != "libart.so" {
+        return false;
+    }
+    path.starts_with("/apex/")
+        || path.starts_with("/system/")
+        || path.starts_with("/system_ext/")
 }
 
 fn matches_module_lookup_name(path: &str, module_name: &str) -> bool {

@@ -15,11 +15,7 @@ use tar::Archive;
 use xz::read::XzDecoder;
 
 /// private function to retry download in case of error.
-fn download_and_use_devkit_internal(
-    kind: &str,
-    version: &str,
-    force_download: bool,
-) -> Result<String, Error> {
+fn download_and_use_devkit_internal(kind: &str, version: &str, force_download: bool) -> Result<String, Error> {
     let mut target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
 
     let out_dir = env::var_os("OUT_DIR").unwrap();
@@ -46,17 +42,14 @@ fn download_and_use_devkit_internal(
 
     if !devkit_path.is_dir() {
         if !devkit_tar.is_file() {
-            let frida_url = format!(
-                "https://github.com/frida/frida/releases/download/{version}/{devkit_name}.tar.xz",
-            );
+            let frida_url = format!("https://github.com/frida/frida/releases/download/{version}/{devkit_name}.tar.xz",);
 
             println!(
                 "cargo:warning=Frida {} devkit not found, downloading from {}...",
                 kind, &frida_url,
             );
             // Download devkit
-            let mut resp =
-                reqwest::blocking::get(&frida_url).expect("devkit download request failed");
+            let mut resp = reqwest::blocking::get(&frida_url).expect("devkit download request failed");
             let mut out = File::create(&devkit_tar).expect("failed to create devkit tar file");
             io::copy(&mut resp, &mut out).expect("failed to copy devkit tar content");
         }

@@ -1,10 +1,7 @@
 //! Process helpers.
 //!
 
-#![cfg_attr(
-    any(target_arch = "x86_64", target_arch = "x86"),
-    allow(clippy::unnecessary_cast)
-)]
+#![cfg_attr(any(target_arch = "x86_64", target_arch = "x86"), allow(clippy::unnecessary_cast))]
 
 use crate::{FileMapping, Module, NativePointer};
 
@@ -86,12 +83,9 @@ impl<'a> Process<'a> {
     /// Initialize a new process
     pub fn obtain(gum: &'a Gum) -> Process<'a> {
         let id = unsafe { gum_sys::gum_process_get_id() };
-        let platform =
-            num::FromPrimitive::from_u32(unsafe { gum_sys::gum_process_get_native_os() }).unwrap();
-        let code_signing_policy = num::FromPrimitive::from_u32(unsafe {
-            gum_sys::gum_process_get_code_signing_policy() as u32
-        })
-        .unwrap();
+        let platform = num::FromPrimitive::from_u32(unsafe { gum_sys::gum_process_get_native_os() }).unwrap();
+        let code_signing_policy =
+            num::FromPrimitive::from_u32(unsafe { gum_sys::gum_process_get_code_signing_policy() as u32 }).unwrap();
 
         let main_module = unsafe { Module::from_raw(gum_sys::gum_process_get_main_module()) };
 
@@ -229,9 +223,7 @@ impl<'a> Process<'a> {
             1
         }
 
-        let callback_data = CallbackData {
-            modules: Vec::new(),
-        };
+        let callback_data = CallbackData { modules: Vec::new() };
 
         unsafe {
             gum_sys::gum_process_enumerate_modules(

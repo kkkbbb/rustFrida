@@ -4,8 +4,9 @@
 
 /// Hook 类型：统一 Clone+Replace 策略
 /// 所有回调统一 JNI 调用约定: x0=JNIEnv*, x1=this/jclass, x2+=args
+#[derive(Debug)]
 pub(super) enum HookType {
-    /// Unified replacement hook
+    /// Unified replacement hook (art_router swaps ArtMethod*)
     /// - replacement_addr: heap-allocated replacement ArtMethod (native, jniCode=thunk)
     /// - per_method_hook_target: Some(quickCode) for compiled methods (Layer 3 router hook),
     ///   None for shared stub methods (routed via Layer 1/2)
@@ -42,6 +43,10 @@ pub(super) struct JavaHookData {
     // Hooked class name (dot notation, for wrapping object args)
     #[allow(dead_code)]
     pub(super) class_name: String,
+    /// Layer 3 art_router trampoline 地址 (quickCode 原始指令 + jump back)。
+    /// callback skip fallback 用它直接调原始方法，避免走 JNI re-entry 路径。
+    /// 0 = 无 trampoline（非 compiled 方法，走 Layer 1/2 路由）。
+    pub(super) quick_trampoline: u64,
 }
 
 unsafe impl Send for JavaHookData {}

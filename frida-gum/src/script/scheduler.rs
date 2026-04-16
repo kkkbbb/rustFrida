@@ -29,8 +29,6 @@ impl Scheduler {
     }
 
     pub fn get_context(&self) -> Context {
-        Context::from_raw(&self, unsafe {
-            gum_script_scheduler_get_js_context(self.internal)
-        })
+        Context::from_raw(&self, unsafe { gum_script_scheduler_get_js_context(self.internal) })
     }
 }

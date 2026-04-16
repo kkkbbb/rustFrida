@@ -39,12 +39,7 @@ fn get_or_init_class_id(ctx: *mut ffi::JSContext) -> u32 {
         let mut new_id: u32 = 0;
         new_id = unsafe { ffi::JS_NewClassID(&mut new_id) };
         // CAS: if another thread beat us, use theirs.
-        match NATIVE_POINTER_CLASS_ID.compare_exchange(
-            0,
-            new_id,
-            Ordering::SeqCst,
-            Ordering::Relaxed,
-        ) {
+        match NATIVE_POINTER_CLASS_ID.compare_exchange(0, new_id, Ordering::SeqCst, Ordering::Relaxed) {
             Ok(_) => class_id = new_id,
             Err(existing) => class_id = existing,
         }
@@ -133,18 +128,13 @@ unsafe extern "C" fn js_ptr(
 
         addr = match u64::from_str_radix(s, 16) {
             Ok(v) => v,
-            Err(_) => {
-                return ffi::JS_ThrowTypeError(ctx, b"Invalid hex string\0".as_ptr() as *const _)
-            }
+            Err(_) => return ffi::JS_ThrowTypeError(ctx, b"Invalid hex string\0".as_ptr() as *const _),
         };
     } else if arg.is_int() || arg.is_float() || ffi::qjs_is_big_int(ctx, arg.raw()) != 0 {
         // Number or BigInt (hook ctx.thisObj / ctx.args[] / ctx.x0-x30)
         let mut v: u64 = 0;
         if ffi::qjs_value_to_u64(ctx, &mut v, arg.raw()) != 0 {
-            return ffi::JS_ThrowTypeError(
-                ctx,
-                b"ptr() failed to convert numeric value\0".as_ptr() as *const _,
-            );
+            return ffi::JS_ThrowTypeError(ctx, b"ptr() failed to convert numeric value\0".as_ptr() as *const _);
         }
         addr = v;
     } else if let Some(ptr_addr) = get_native_pointer_addr(ctx, arg) {
@@ -334,6 +324,10 @@ pub fn register_ptr(ctx: &JSContext) {
         add_cfunction_to_object(ctx_ptr, proto, "toJSON", native_pointer_to_json, 0);
         add_cfunction_to_object(ctx_ptr, proto, "toNumber", native_pointer_to_number, 0);
         add_cfunction_to_object(ctx_ptr, proto, "toInt", native_pointer_to_number, 0);
+
+        // Frida 兼容: 注册 Memory 读写方法到 NativePointer prototype
+        // 支持 ptr.readU32() / ptr.writeU32(val) 调用风格
+        crate::jsapi::memory::register_ptr_methods(ctx_ptr, proto);
 
         // Set as class prototype
         ffi::JS_SetClassProto(ctx_ptr, class_id, proto);

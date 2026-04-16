@@ -22,8 +22,7 @@ impl MatchPattern {
     pub fn from_string(pattern: &str) -> Option<Self> {
         let pattern = CString::new(pattern).unwrap();
 
-        let internal =
-            unsafe { gum_sys::gum_match_pattern_new_from_string(pattern.as_ptr().cast()) };
+        let internal = unsafe { gum_sys::gum_match_pattern_new_from_string(pattern.as_ptr().cast()) };
         if !internal.is_null() {
             Some(Self { internal })
         } else {
@@ -86,8 +85,7 @@ impl MemoryRange {
             }
 
             extern "C" fn callback64(address: u64, size: u64, user_data: *mut c_void) -> i32 {
-                let results: &mut Vec<ScanResult> =
-                    unsafe { &mut *(user_data as *mut Vec<ScanResult>) };
+                let results: &mut Vec<ScanResult> = unsafe { &mut *(user_data as *mut Vec<ScanResult>) };
                 results.push(ScanResult {
                     address: address as usize,
                     size: size as usize,

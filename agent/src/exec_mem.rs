@@ -1,14 +1,13 @@
 //! ExecMem - 可读写可执行内存分配器
 
-use libc::{
-    mmap, munmap, sysconf, MAP_ANONYMOUS, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE,
-    _SC_PAGESIZE,
-};
+use crate::vma_name::set_anon_vma_name_raw;
+use libc::{mmap, munmap, sysconf, MAP_ANONYMOUS, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE, _SC_PAGESIZE};
 use std::io::Error;
 use std::ptr;
 use std::ptr::null_mut;
 
 type Result<T> = std::result::Result<T, String>;
+static TRACE_EXEC_VMA_NAME: &[u8] = b"wwb_trace_exec\0";
 
 pub struct ExecMem {
     pub(crate) ptr: *mut u8,
@@ -33,6 +32,7 @@ impl ExecMem {
             if ptr == libc::MAP_FAILED {
                 return Err(Error::last_os_error().to_string());
             }
+            let _ = set_anon_vma_name_raw(ptr as *mut u8, page_size, TRACE_EXEC_VMA_NAME);
             Ok(ExecMem {
                 ptr: ptr as *mut u8,
                 size: page_size,
@@ -87,6 +87,7 @@ impl ExecMem {
                     Error::last_os_error()
                 ));
             }
+            let _ = set_anon_vma_name_raw(new_ptr as *mut u8, new_size, TRACE_EXEC_VMA_NAME);
             // 拷贝旧数据
             ptr::copy_nonoverlapping(self.ptr, new_ptr as *mut u8, self.used);
             // 释放旧内存

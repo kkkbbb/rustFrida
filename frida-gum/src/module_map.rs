@@ -5,10 +5,7 @@
  * Licence: wxWindows Library Licence, Version 3.1
  */
 
-#![cfg_attr(
-    any(target_arch = "x86_64", target_arch = "x86"),
-    allow(clippy::unnecessary_cast)
-)]
+#![cfg_attr(any(target_arch = "x86_64", target_arch = "x86"), allow(clippy::unnecessary_cast))]
 
 use {
     crate::Module,
@@ -38,10 +35,7 @@ impl ModuleMap {
 
     /// Create a new [`ModuleMap`] with a filter function
     pub fn new_with_filter(filter: &mut dyn FnMut(Module) -> bool) -> Self {
-        unsafe extern "C" fn module_map_filter(
-            details: *mut gum_sys::GumModule,
-            callback: *mut c_void,
-        ) -> i32 {
+        unsafe extern "C" fn module_map_filter(details: *mut gum_sys::GumModule, callback: *mut c_void) -> i32 {
             let callback = &mut *(callback as *mut Box<&mut dyn FnMut(Module) -> bool>);
             i32::from((callback)(Module::from_raw(details)))
         }
@@ -61,11 +55,9 @@ impl ModuleMap {
             for name in names {
                 if (name.starts_with('/') && details.path().eq(name))
                     || (name.contains('/')
-                        && details.name().eq(Path::new(name)
-                            .file_name()
-                            .unwrap()
-                            .to_str()
-                            .unwrap()))
+                        && details
+                            .name()
+                            .eq(Path::new(name).file_name().unwrap().to_str().unwrap()))
                     || (details.name().eq(name))
                 {
                     return true;
@@ -89,10 +81,8 @@ impl ModuleMap {
     pub fn values(&self) -> Vec<Module> {
         unsafe {
             let array = gum_sys::gum_module_map_get_values(self.module_map);
-            let raw_module_details = from_raw_parts(
-                (*array).pdata as *const *mut gum_sys::GumModule,
-                (*array).len as usize,
-            );
+            let raw_module_details =
+                from_raw_parts((*array).pdata as *const *mut gum_sys::GumModule, (*array).len as usize);
 
             raw_module_details
                 .iter()

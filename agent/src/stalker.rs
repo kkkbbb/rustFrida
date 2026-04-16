@@ -131,8 +131,7 @@ pub fn get_stalker() -> &'static mut Stalker {
 /// 获取全局 Interceptor
 #[inline]
 pub fn get_interceptor() -> &'static mut Interceptor {
-    let cell = GLOBAL_INTERCEPTOR
-        .get_or_init(|| InterceptorCell(UnsafeCell::new(Interceptor::obtain(&GUM))));
+    let cell = GLOBAL_INTERCEPTOR.get_or_init(|| InterceptorCell(UnsafeCell::new(Interceptor::obtain(&GUM))));
     unsafe { &mut *cell.0.get() }
 }
 

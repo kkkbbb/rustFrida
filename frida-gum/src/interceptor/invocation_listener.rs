@@ -4,10 +4,7 @@
  * Licence: wxWindows Library Licence, Version 3.1
  */
 
-#![cfg_attr(
-    any(target_arch = "x86_64", target_arch = "x86"),
-    allow(clippy::unnecessary_cast)
-)]
+#![cfg_attr(any(target_arch = "x86_64", target_arch = "x86"), allow(clippy::unnecessary_cast))]
 
 use {
     crate::{CpuContext, NativePointer},
@@ -119,13 +116,7 @@ impl<'a> InvocationContext<'a> {
 
     /// Set a numbered argument in the processor context, determined by the platform calling convention.
     pub fn set_arg(&self, n: u32, value: usize) {
-        unsafe {
-            gum_sys::gum_invocation_context_replace_nth_argument(
-                self.context,
-                n,
-                value as *mut c_void,
-            )
-        }
+        unsafe { gum_sys::gum_invocation_context_replace_nth_argument(self.context, n, value as *mut c_void) }
     }
 
     /// Get the value of the register used for the platform calling convention's return value.
@@ -135,9 +126,7 @@ impl<'a> InvocationContext<'a> {
 
     /// Set the value of the register used for the platform calling convention's return value.
     pub fn set_return_value(&self, value: usize) {
-        unsafe {
-            gum_sys::gum_invocation_context_replace_return_value(self.context, value as *mut c_void)
-        }
+        unsafe { gum_sys::gum_invocation_context_replace_return_value(self.context, value as *mut c_void) }
     }
 
     /// Get the destination address after the function returns.
@@ -147,8 +136,7 @@ impl<'a> InvocationContext<'a> {
 
     /// Get the `replacement_data` passed at replace time.
     pub fn replacement_data(&mut self) -> Option<NativePointer> {
-        let replacement_data =
-            unsafe { gum_sys::gum_invocation_context_get_replacement_data(self.context) };
+        let replacement_data = unsafe { gum_sys::gum_invocation_context_get_replacement_data(self.context) };
         if replacement_data.is_null() {
             None
         } else {

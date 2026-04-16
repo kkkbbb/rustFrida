@@ -1,12 +1,10 @@
 use crate::ffi;
-use crate::ffi::hook as hook_ffi;
 use crate::jsapi::callback_util::{extract_string_arg, with_registry, with_registry_mut};
-use crate::jsapi::console::output_message;
+use crate::jsapi::console::output_verbose;
 use crate::value::JSValue;
 
 use super::super::callback::*;
 use super::super::jni_core::*;
-use super::super::release_java_hook_resources;
 
 pub(in crate::jsapi::java) unsafe extern "C" fn js_java_unhook(
     ctx: *mut ffi::JSContext,
@@ -25,29 +23,17 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_unhook(
     let method_arg = JSValue(*argv.add(1));
     let sig_arg = JSValue(*argv.add(2));
 
-    let class_name = match extract_string_arg(
-        ctx,
-        class_arg,
-        b"Java.unhook() first argument must be a string\0",
-    ) {
+    let class_name = match extract_string_arg(ctx, class_arg, b"Java.unhook() first argument must be a string\0") {
         Ok(value) => value,
         Err(err) => return err,
     };
 
-    let method_name = match extract_string_arg(
-        ctx,
-        method_arg,
-        b"Java.unhook() second argument must be a string\0",
-    ) {
+    let method_name = match extract_string_arg(ctx, method_arg, b"Java.unhook() second argument must be a string\0") {
         Ok(value) => value,
         Err(err) => return err,
     };
 
-    let sig_str = match extract_string_arg(
-        ctx,
-        sig_arg,
-        b"Java.unhook() third argument must be a string\0",
-    ) {
+    let sig_str = match extract_string_arg(ctx, sig_arg, b"Java.unhook() third argument must be a string\0") {
         Ok(value) => value,
         Err(err) => return err,
     };
@@ -60,10 +46,7 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_unhook(
 
     let key = method_key(&class_name, &method_name, &actual_sig);
     let art_method_addr = with_registry(&JAVA_HOOK_REGISTRY, |registry| {
-        registry
-            .iter()
-            .find(|(_, v)| v.method_key == key)
-            .map(|(k, _)| *k)
+        registry.iter().find(|(_, v)| v.method_key == key).map(|(k, _)| *k)
     })
     .flatten();
 
@@ -74,10 +57,7 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_unhook(
         }
     };
 
-    let hook_data = with_registry_mut(&JAVA_HOOK_REGISTRY, |registry| {
-        registry.remove(&art_method_addr)
-    })
-    .flatten();
+    let hook_data = with_registry_mut(&JAVA_HOOK_REGISTRY, |registry| registry.remove(&art_method_addr)).flatten();
 
     let hook_data = match hook_data {
         Some(d) => d,
@@ -86,71 +66,36 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_unhook(
         }
     };
 
-    match &hook_data.hook_type {
-        HookType::Replaced {
-            replacement_addr,
-            per_method_hook_target,
-        } => {
-            output_message(&format!(
-                "[java unhook] 开始: art_method={:#x}, replacement={:#x}, per_method={:?}",
-                hook_data.art_method, replacement_addr, per_method_hook_target
-            ));
+    output_verbose(&format!(
+        "[java unhook] 开始: art_method={:#x}, type={:?}",
+        hook_data.art_method, hook_data.hook_type
+    ));
 
-            delete_replacement_method(hook_data.art_method);
-            output_message("[java unhook] Step 1: replacedMethods 已删除");
+    // Step 1: 删除 art_router 映射，切断路由
+    delete_replacement_method(hook_data.art_method);
 
-            if let Some(target) = per_method_hook_target {
-                hook_ffi::hook_remove(*target as *mut std::ffi::c_void);
-                output_message(&format!(
-                    "[java unhook] Step 2: Layer 3 hook 已移除: {:#x}",
-                    target
-                ));
-            }
+    // Step 2: 移除 Layer 3 per-method hook + stealth2 revert
+    super::super::remove_per_method_hook(&hook_data);
 
-            if let Some(spec) = ART_METHOD_SPEC.get() {
-                let ep_offset = spec.entry_point_offset;
-                let data_off = spec.data_offset;
+    // Step 3: 恢复 ArtMethod 原始字段
+    super::super::restore_art_method_fields(&hook_data);
 
-                std::ptr::write_volatile(
-                    (hook_data.art_method as usize + spec.access_flags_offset) as *mut u32,
-                    hook_data.original_access_flags,
-                );
-                std::ptr::write_volatile(
-                    (hook_data.art_method as usize + data_off) as *mut u64,
-                    hook_data.original_data,
-                );
-                std::ptr::write_volatile(
-                    (hook_data.art_method as usize + ep_offset) as *mut u64,
-                    hook_data.original_entry_point,
-                );
+    // Step 4: 移除 native trampoline
+    super::super::remove_native_trampoline(&hook_data);
 
-                hook_ffi::hook_flush_cache(
-                    (hook_data.art_method as usize) as *mut std::ffi::c_void,
-                    ep_offset + 8,
-                );
-                output_message("[java unhook] Step 3: ArtMethod 字段已恢复");
-            }
-
-            hook_ffi::hook_remove_redirect(hook_data.art_method);
-            output_message("[java unhook] Step 4: native trampoline 已移除");
-
-            if !wait_for_in_flight_java_hook_callbacks(std::time::Duration::from_millis(200)) {
-                output_message(&format!(
-                    "[java unhook] 等待 in-flight callbacks 超时，remaining={}",
-                    in_flight_java_hook_callbacks()
-                ));
-            }
-            output_message(&format!(
-                "[java unhook] Step 5: in-flight callbacks 已收敛，replacement={:#x}",
-                replacement_addr
-            ));
-        }
+    // Step 5: 等待 in-flight callbacks 自然退出
+    if !wait_for_in_flight_java_hook_callbacks(std::time::Duration::from_millis(200)) {
+        output_verbose(&format!(
+            "[java unhook] 等待 in-flight callbacks 超时，remaining={}",
+            in_flight_java_hook_callbacks()
+        ));
     }
 
+    // Step 6: 释放资源
     let env_opt = get_thread_env().ok();
-    release_java_hook_resources(&hook_data, env_opt, false, true);
+    super::super::free_java_hook_resources(&hook_data, env_opt);
 
-    output_message(&format!(
+    output_verbose(&format!(
         "[java unhook] 完成: {}.{}{}",
         class_name, method_name, actual_sig
     ));

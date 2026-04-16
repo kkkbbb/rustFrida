@@ -107,12 +107,26 @@ unsafe fn module_dlopen(module_name: &str) -> *mut std::ffi::c_void {
 
 /// Resolve a symbol from an arbitrary module, bypassing linker namespace restrictions.
 ///
-/// hide_soinfo 摘除 agent soinfo 后，libc::dlsym(RTLD_DEFAULT) 可能导致 linker
-/// 内部空指针崩溃（caller soinfo 不存在），因此跳过 fast path，直接走 unrestricted API。
+/// **Primary path**: directly parse the module's ELF `.symtab`/`.dynsym` from disk.
+/// This bypasses the linker's namespace machinery entirely (which can silently
+/// return NULL for cross-namespace `dlopen("libc.so", RTLD_NOLOAD)` on modern
+/// Android even though the library is loaded).
+///
+/// **Fallback**: unrestricted linker `__loader_dlopen` + `__loader_dlvsym` for
+/// modules whose backing file is not on disk (memfd, synthetic modules).
 pub(crate) unsafe fn module_dlsym(module_name: &str, symbol: &str) -> *mut std::ffi::c_void {
-    let c_sym = CString::new(symbol).unwrap();
+    // Primary: direct ELF symbol lookup from disk file.
+    if let Some((path, base)) = find_module_path_and_base(module_name) {
+        let syms = elf_module_find_symbols(&path, base, &[symbol]);
+        if let Some(&addr) = syms.get(symbol) {
+            return addr as *mut std::ffi::c_void;
+        }
+    }
 
-    // Unrestricted path (skip RTLD_DEFAULT fast path — crashes after soinfo removal)
+    // Fallback: unrestricted linker dlopen + dlvsym.
+    // hide_soinfo 摘除 agent soinfo 后 libc::dlsym(RTLD_DEFAULT) 会崩溃，
+    // 因此跳过 fast path 直接走 unrestricted API。
+    let c_sym = CString::new(symbol).unwrap();
     let api = UNRESTRICTED_LINKER_API.get_or_init(|| init_unrestricted_linker_api());
     if let Some(api) = api {
         let handle = module_dlopen(module_name);

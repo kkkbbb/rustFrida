@@ -82,7 +82,7 @@ unsafe fn resolve_quick_entrypoint_from_trampoline(trampoline: u64, env: JniEnv)
     // 读取 *(thread + offset) 作为 resolved entrypoint
     let resolved = *((thread as usize + offset as usize) as *const u64) & PAC_STRIP_MASK;
     if resolved != 0 {
-        output_message(&format!(
+        output_verbose(&format!(
             "[art bridge] 解析 trampoline {:#x} → Thread+{:#x} → entrypoint {:#x}",
             trampoline, offset, resolved
         ));
@@ -104,66 +104,66 @@ pub(super) unsafe fn find_art_bridge_functions(
     _ep_offset: usize,
 ) -> &'static ArtBridgeFunctions {
     ART_BRIDGE_FUNCTIONS.get_or_init(|| {
-        output_message("[art bridge] 开始发现 ART 内部桥接函数...");
+        output_verbose("[art bridge] 开始发现 ART 内部桥接函数...");
 
         // --- ClassLinker 扫描: 一次提取 4 个 trampoline ---
         let (jni_tramp, interp_bridge, resolution_tramp, imt_conflict) = find_classlinker_trampolines(env);
 
-        output_message(&format!(
+        output_verbose(&format!(
             "[art bridge] ClassLinker 结果: jni_tramp={:#x}, interp_bridge={:#x}, resolution_tramp={:#x}, imt_conflict={:#x}",
             jni_tramp, interp_bridge, resolution_tramp, imt_conflict
         ));
 
         // --- dlsym: Nterp 入口点 ---
         let nterp = find_nterp_entry_point();
-        output_message(&format!("[art bridge] nterp_entry_point={:#x}", nterp));
+        output_verbose(&format!("[art bridge] nterp_entry_point={:#x}", nterp));
 
         // --- dlsym: DoCall 模板实例 ---
         let do_calls = find_do_call_symbols();
-        output_message(&format!("[art bridge] DoCall 实例数={}", do_calls.len()));
+        output_verbose(&format!("[art bridge] DoCall 实例数={}", do_calls.len()));
         for (i, addr) in do_calls.iter().enumerate() {
-            output_message(&format!("[art bridge]   DoCall[{}]={:#x}", i, addr));
+            output_verbose(&format!("[art bridge]   DoCall[{}]={:#x}", i, addr));
         }
 
         // --- dlsym: GC ConcurrentCopying::CopyingPhase ---
         let gc_phase = find_gc_copying_phase();
-        output_message(&format!("[art bridge] gc_copying_phase={:#x}", gc_phase));
+        output_verbose(&format!("[art bridge] gc_copying_phase={:#x}", gc_phase));
 
         // --- dlsym: Heap::CollectGarbageInternal ---
         let gc_collect = find_gc_collect_internal();
-        output_message(&format!("[art bridge] gc_collect_internal={:#x}", gc_collect));
+        output_verbose(&format!("[art bridge] gc_collect_internal={:#x}", gc_collect));
 
         // --- dlsym: Thread::RunFlipFunction ---
         let run_flip = find_run_flip_function();
-        output_message(&format!("[art bridge] run_flip_function={:#x}", run_flip));
+        output_verbose(&format!("[art bridge] run_flip_function={:#x}", run_flip));
 
         // --- dlsym: ArtMethod::GetOatQuickMethodHeader ---
         let get_oat_header = find_get_oat_quick_method_header();
-        output_message(&format!("[art bridge] get_oat_quick_method_header={:#x}", get_oat_header));
+        output_verbose(&format!("[art bridge] get_oat_quick_method_header={:#x}", get_oat_header));
 
         // --- dlsym: FixupStaticTrampolines / MakeInitializedClassesVisiblyInitialized ---
         let fixup_static = find_fixup_static_trampolines();
-        output_message(&format!("[art bridge] fixup_static_trampolines={:#x}", fixup_static));
+        output_verbose(&format!("[art bridge] fixup_static_trampolines={:#x}", fixup_static));
 
         // --- dlsym: Thread::Current() (递归防护用) ---
         let thread_current = find_thread_current();
-        output_message(&format!("[art bridge] thread_current={:#x}", thread_current));
+        output_verbose(&format!("[art bridge] thread_current={:#x}", thread_current));
 
         // --- dlsym: ArtMethod::PrettyMethod (NULL 指针崩溃防护) ---
         let pretty_method = find_pretty_method();
-        output_message(&format!("[art bridge] pretty_method={:#x}", pretty_method));
+        output_verbose(&format!("[art bridge] pretty_method={:#x}", pretty_method));
 
         // --- 解析 trampoline → 真实 quick entrypoint ---
         let resolved_jni = resolve_quick_entrypoint_from_trampoline(jni_tramp, env);
         let resolved_interp = resolve_quick_entrypoint_from_trampoline(interp_bridge, env);
         let resolved_resolution = resolve_quick_entrypoint_from_trampoline(resolution_tramp, env);
 
-        output_message(&format!(
+        output_verbose(&format!(
             "[art bridge] resolved entrypoints: jni={:#x}, interp={:#x}, resolution={:#x}",
             resolved_jni, resolved_interp, resolved_resolution
         ));
 
-        output_message("[art bridge] ART 桥接函数发现完成");
+        output_verbose("[art bridge] ART 桥接函数发现完成");
 
         ArtBridgeFunctions {
             quick_generic_jni_trampoline: jni_tramp,
@@ -207,7 +207,7 @@ unsafe fn find_classlinker_trampolines(_env: JniEnv) -> (u64, u64, u64, u64) {
     let imt_sym = crate::jsapi::module::libart_dlsym("art_quick_imt_conflict_trampoline");
 
     if !jni_sym.is_null() && !interp_sym.is_null() && !resolution_sym.is_null() {
-        output_message("[art bridge] 全部通过 dlsym 发现");
+        output_verbose("[art bridge] 全部通过 dlsym 发现");
         return (
             jni_sym as u64,
             interp_sym as u64,
@@ -219,12 +219,12 @@ unsafe fn find_classlinker_trampolines(_env: JniEnv) -> (u64, u64, u64, u64) {
     // --- Strategy 2: ClassLinker 扫描 (主要策略) ---
     // art_quick_* 是 LOCAL HIDDEN 符号，APEX namespace 限制下 dlsym 找不到
     // 必须通过 ClassLinker 结构体内存扫描获取
-    output_message("[art bridge] dlsym 未能获取全部地址，尝试 ClassLinker 扫描...");
+    output_verbose("[art bridge] dlsym 未能获取全部地址，尝试 ClassLinker 扫描...");
 
     let (runtime, java_vm_off) = match find_runtime_java_vm() {
         Some(v) => v,
         None => {
-            output_message("[art bridge] ClassLinker 扫描: 无法获取 Runtime/java_vm_ 偏移");
+            output_verbose("[art bridge] ClassLinker 扫描: 无法获取 Runtime/java_vm_ 偏移");
             return (
                 jni_sym as u64,
                 interp_sym as u64,
@@ -234,14 +234,14 @@ unsafe fn find_classlinker_trampolines(_env: JniEnv) -> (u64, u64, u64, u64) {
         }
     };
 
-    output_message(&format!(
+    output_verbose(&format!(
         "[art bridge] Runtime={:#x}, java_vm_ 在 Runtime+{:#x}",
         runtime, java_vm_off
     ));
 
     let api_level = get_android_api_level();
     let codename = get_android_codename();
-    output_message(&format!(
+    output_verbose(&format!(
         "[art bridge] Android API level: {}, codename: '{}'",
         api_level, codename
     ));
@@ -262,7 +262,7 @@ unsafe fn find_classlinker_trampolines(_env: JniEnv) -> (u64, u64, u64, u64) {
             continue;
         }
 
-        output_message(&format!(
+        output_verbose(&format!(
             "[art bridge] 候选: classLinker={:#x} (Runtime+{:#x}), internTable={:#x} (Runtime+{:#x})",
             class_linker, cl_off, intern_table, intern_table_off
         ));
@@ -277,7 +277,7 @@ unsafe fn find_classlinker_trampolines(_env: JniEnv) -> (u64, u64, u64, u64) {
             let val_stripped = val & PAC_STRIP_MASK;
             if val_stripped == intern_table {
                 intern_table_cl_offset = Some(offset);
-                output_message(&format!(
+                output_verbose(&format!(
                     "[art bridge] 找到 intern_table_ 在 ClassLinker+{:#x}",
                     offset
                 ));
@@ -288,7 +288,7 @@ unsafe fn find_classlinker_trampolines(_env: JniEnv) -> (u64, u64, u64, u64) {
         let it_off = match intern_table_cl_offset {
             Some(o) => o,
             None => {
-                output_message("[art bridge] 此候选 ClassLinker 中未找到 intern_table_");
+                output_verbose("[art bridge] 此候选 ClassLinker 中未找到 intern_table_");
                 continue;
             }
         };
@@ -324,7 +324,7 @@ unsafe fn find_classlinker_trampolines(_env: JniEnv) -> (u64, u64, u64, u64) {
             safe_read_u64(class_linker + resolution_tramp_off as u64) & PAC_STRIP_MASK;
         let imt_conflict = safe_read_u64(class_linker + imt_conflict_off as u64) & PAC_STRIP_MASK;
 
-        output_message(&format!(
+        output_verbose(&format!(
             "[art bridge] ClassLinker: jni_tramp=ClassLinker+{:#x}={:#x}, interp=ClassLinker+{:#x}={:#x}, resolution=ClassLinker+{:#x}={:#x}, imt_conflict=ClassLinker+{:#x}={:#x}",
             jni_tramp_off, jni_tramp, interp_bridge_off, interp_bridge, resolution_tramp_off, resolution_tramp, imt_conflict_off, imt_conflict
         ));
@@ -363,7 +363,7 @@ unsafe fn find_classlinker_trampolines(_env: JniEnv) -> (u64, u64, u64, u64) {
         }
     }
 
-    output_message("[art bridge] ClassLinker 扫描失败，返回 dlsym 结果（部分可能为0）");
+    output_verbose("[art bridge] ClassLinker 扫描失败，返回 dlsym 结果（部分可能为0）");
     (
         jni_sym as u64,
         interp_sym as u64,
@@ -384,7 +384,7 @@ unsafe fn find_nterp_entry_point() -> u64 {
         let get_nterp: unsafe extern "C" fn() -> u64 = std::mem::transmute(func_ptr);
         let ep = get_nterp();
         if ep != 0 {
-            output_message(&format!(
+            output_verbose(&format!(
                 "[art bridge] Nterp 入口点通过 GetNterpEntryPoint() 获取: {:#x}",
                 ep
             ));
@@ -395,14 +395,14 @@ unsafe fn find_nterp_entry_point() -> u64 {
     // 策略 2: ExecuteNterpImpl（LOCAL HIDDEN，通常无法通过 dlsym 访问）
     let func_ptr2 = libart_dlsym("ExecuteNterpImpl");
     if !func_ptr2.is_null() {
-        output_message(&format!(
+        output_verbose(&format!(
             "[art bridge] Nterp 入口点通过 ExecuteNterpImpl 获取: {:#x}",
             func_ptr2 as u64
         ));
         return func_ptr2 as u64;
     }
 
-    output_message("[art bridge] Nterp 入口点不可用（Android 11 及以下）");
+    output_verbose("[art bridge] Nterp 入口点不可用（Android 11 及以下）");
     0
 }
 
@@ -473,7 +473,7 @@ pub(super) unsafe fn try_invalidate_jit_cache() {
     let func_ptr = libart_dlsym("_ZN3art3jit12JitCodeCache21InvalidateAllMethodsEv");
 
     if func_ptr.is_null() {
-        output_message("[jit cache] InvalidateAllMethods 符号未找到，跳过 JIT 缓存清空");
+        output_verbose("[jit cache] InvalidateAllMethods 符号未找到，跳过 JIT 缓存清空");
         return;
     }
 
@@ -481,7 +481,7 @@ pub(super) unsafe fn try_invalidate_jit_cache() {
     let runtime = match get_runtime_addr() {
         Some(r) => r,
         None => {
-            output_message("[jit cache] 无法获取 Runtime 地址，跳过 JIT 缓存清空");
+            output_verbose("[jit cache] 无法获取 Runtime 地址，跳过 JIT 缓存清空");
             return;
         }
     };
@@ -554,7 +554,7 @@ pub(super) unsafe fn try_invalidate_jit_cache() {
                 type InvalidateAllFn = unsafe extern "C" fn(this: u64);
                 let invalidate: InvalidateAllFn = std::mem::transmute(func_ptr);
                 invalidate(code_cache_stripped);
-                output_message(&format!(
+                output_verbose(&format!(
                     "[jit cache] InvalidateAllMethods 调用成功: JitCodeCache={:#x} (Runtime+{:#x})",
                     code_cache_stripped, offset
                 ));
@@ -562,13 +562,13 @@ pub(super) unsafe fn try_invalidate_jit_cache() {
             }
         }
 
-        output_message("[jit cache] 未找到 Jit* 指针，尝试直接扫描 JitCodeCache...");
+        output_verbose("[jit cache] 未找到 Jit* 指针，尝试直接扫描 JitCodeCache...");
     }
 
     // 方案 C: 直接扫描 Runtime 找 jit_code_cache_ 指针
     // jit_code_cache_ 是一个独立字段，通常紧跟 jit_ 之后
     // 这里我们放弃精确查找，仅记录警告
-    output_message("[jit cache] JIT 缓存清空跳过: 无法定位 JitCodeCache 指针");
+    output_verbose("[jit cache] JIT 缓存清空跳过: 无法定位 JitCodeCache 指针");
 }
 
 /// 查找 GC ConcurrentCopying::CopyingPhase 或 MarkingPhase 符号

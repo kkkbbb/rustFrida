@@ -4,6 +4,7 @@ use crate::context::JSContext;
 use crate::ffi;
 use crate::jsapi::util::add_cfunction_to_object;
 use crate::value::JSValue;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 /// Callback type for console output
@@ -11,6 +12,19 @@ pub type ConsoleCallback = Box<dyn Fn(&str) + Send + 'static>;
 
 /// Global console output callback
 static CONSOLE_CALLBACK: Mutex<Option<ConsoleCallback>> = Mutex::new(None);
+
+/// 全局 verbose 开关（由 host 端 --verbose 传入）
+static VERBOSE: AtomicBool = AtomicBool::new(false);
+
+/// 设置 verbose 模式
+pub fn set_verbose(on: bool) {
+    VERBOSE.store(on, Ordering::Relaxed);
+}
+
+/// 查询 verbose 模式
+pub fn is_verbose() -> bool {
+    VERBOSE.load(Ordering::Relaxed)
+}
 
 /// Set the console output callback
 pub fn set_console_callback<F>(callback: F)
@@ -35,6 +49,13 @@ pub(crate) fn output_message(msg: &str) {
     } else {
         // Default: print to stderr (for Android logcat)
         eprintln!("[JS] {}", msg);
+    }
+}
+
+/// 仅 verbose 模式时输出的诊断信息
+pub(crate) fn output_verbose(msg: &str) {
+    if VERBOSE.load(Ordering::Relaxed) {
+        output_message(msg);
     }
 }
 

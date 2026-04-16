@@ -1,12 +1,11 @@
 use crate::data::{
-    encode_raw_event_chunk, encode_raw_event_into, raw_event_size, transcode_raw_chunk,
-    TraceBundleEvent, TraceBundleEventKind,
+    encode_raw_event_chunk, encode_raw_event_into, raw_event_size, transcode_raw_chunk, TraceBundleEvent,
+    TraceBundleEventKind,
 };
 use crate::state::{
-    helper_log, log_trace_stats, reset_trace_stats, update_max, TraceChunk, TraceWriter,
-    TRACE_CHUNK_SIZE, TRACE_FINALIZERS, TRACE_MAX_CHUNK_BYTES, TRACE_MERGE_NS, TRACE_NEXT_SEQ,
-    TRACE_OUTPUT_DIR, TRACE_PUBLISHED_SESSION, TRACE_PUBLISH_LOCK, TRACE_QUEUE_BUDGET,
-    TRACE_SESSION_SEQ, TRACE_SHARDS, TRACE_TRANSCODE_NS, TRACE_WRITER,
+    helper_log, log_trace_stats, reset_trace_stats, update_max, TraceChunk, TraceWriter, TRACE_CHUNK_SIZE,
+    TRACE_FINALIZERS, TRACE_MAX_CHUNK_BYTES, TRACE_MERGE_NS, TRACE_NEXT_SEQ, TRACE_OUTPUT_DIR, TRACE_PUBLISHED_SESSION,
+    TRACE_PUBLISH_LOCK, TRACE_QUEUE_BUDGET, TRACE_SESSION_SEQ, TRACE_SHARDS, TRACE_TRANSCODE_NS, TRACE_WRITER,
 };
 use crossbeam_channel::unbounded;
 use std::fs::{remove_file, File, OpenOptions};
@@ -64,10 +63,7 @@ fn spawn_trace_writer(base: &str, session_id: u64) -> Result<TraceWriter, String
                         continue;
                     }
                 };
-                TRACE_TRANSCODE_NS.fetch_add(
-                    transcode_start.elapsed().as_nanos() as u64,
-                    Ordering::Relaxed,
-                );
+                TRACE_TRANSCODE_NS.fetch_add(transcode_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 encoded.extend_from_slice(&encoded_chunk);
                 if writer.write_all(&chunk.seq.to_le_bytes()).is_err() {
                     helper_log("[qbdi-helper] write shard seq failed");
@@ -120,10 +116,7 @@ fn spawn_trace_writer(base: &str, session_id: u64) -> Result<TraceWriter, String
                         continue;
                     }
                 };
-                TRACE_TRANSCODE_NS.fetch_add(
-                    transcode_start.elapsed().as_nanos() as u64,
-                    Ordering::Relaxed,
-                );
+                TRACE_TRANSCODE_NS.fetch_add(transcode_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 encoded.extend_from_slice(&encoded_chunk);
                 if writer.write_all(&chunk.seq.to_le_bytes()).is_err() {
                     helper_log("[qbdi-helper] write dynamic shard seq failed");
@@ -235,13 +228,11 @@ fn submit_chunk_inner(payload: Vec<u8>, dynamic: bool) {
                     let chunk = err.into_inner();
                     TRACE_QUEUE_BUDGET.release(payload_len);
                     if dynamic {
-                        crate::state::TRACE_DYNAMIC_CHUNKS_DROPPED_DISCONNECTED
-                            .fetch_add(1, Ordering::Relaxed);
+                        crate::state::TRACE_DYNAMIC_CHUNKS_DROPPED_DISCONNECTED.fetch_add(1, Ordering::Relaxed);
                         crate::state::TRACE_DYNAMIC_BYTES_DROPPED_DISCONNECTED
                             .fetch_add(chunk.payload.len() as u64, Ordering::Relaxed);
                     } else {
-                        crate::state::TRACE_CHUNKS_DROPPED_DISCONNECTED
-                            .fetch_add(1, Ordering::Relaxed);
+                        crate::state::TRACE_CHUNKS_DROPPED_DISCONNECTED.fetch_add(1, Ordering::Relaxed);
                         crate::state::TRACE_BYTES_DROPPED_DISCONNECTED
                             .fetch_add(chunk.payload.len() as u64, Ordering::Relaxed);
                     }
@@ -315,8 +306,7 @@ fn publish_merged_bundle(base: &str, session_id: u64, tmp_path: &str) -> Result<
         let _ = remove_file(tmp_path);
         return Ok(());
     }
-    std::fs::rename(tmp_path, &final_path)
-        .map_err(|err| format!("publish {} failed: {}", final_path, err))?;
+    std::fs::rename(tmp_path, &final_path).map_err(|err| format!("publish {} failed: {}", final_path, err))?;
     TRACE_PUBLISHED_SESSION.store(session_id, Ordering::Relaxed);
     Ok(())
 }
@@ -345,8 +335,7 @@ fn merge_trace_shards(base: &str, session_id: u64) -> Result<(), String> {
             .open(&path)
             .map_err(|err| format!("open {} failed: {}", path, err))?;
         let mut reader = BufReader::new(file);
-        let head =
-            read_shard_chunk(&mut reader).map_err(|err| format!("read {} failed: {}", path, err))?;
+        let head = read_shard_chunk(&mut reader).map_err(|err| format!("read {} failed: {}", path, err))?;
         readers.push(reader);
         current.push(head);
     }
@@ -357,8 +346,7 @@ fn merge_trace_shards(base: &str, session_id: u64) -> Result<(), String> {
             .open(&path)
             .map_err(|err| format!("open {} failed: {}", path, err))?;
         let mut reader = BufReader::new(file);
-        let head =
-            read_shard_chunk(&mut reader).map_err(|err| format!("read {} failed: {}", path, err))?;
+        let head = read_shard_chunk(&mut reader).map_err(|err| format!("read {} failed: {}", path, err))?;
         readers.push(reader);
         current.push(head);
     }
@@ -377,8 +365,8 @@ fn merge_trace_shards(base: &str, session_id: u64) -> Result<(), String> {
         final_file
             .write_all(&chunk.payload)
             .map_err(|err| format!("write {} failed: {}", tmp_path, err))?;
-        current[idx] = read_shard_chunk(&mut readers[idx])
-            .map_err(|err| format!("read shard {} failed: {}", idx, err))?;
+        current[idx] =
+            read_shard_chunk(&mut readers[idx]).map_err(|err| format!("read shard {} failed: {}", idx, err))?;
     }
 
     final_file
@@ -417,10 +405,7 @@ pub(crate) fn finalize_trace_session_async() {
     };
     if let Some(writer) = writer {
         let handle = std::thread::spawn(move || finalize_trace_writer(writer));
-        TRACE_FINALIZERS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(handle);
+        TRACE_FINALIZERS.lock().unwrap_or_else(|e| e.into_inner()).push(handle);
     }
 }
 

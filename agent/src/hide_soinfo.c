@@ -187,30 +187,28 @@ static int resolve_linker_syms(const char *path, uint64_t base, linker_syms_t *o
 /**
  * 从 solist_add_soinfo 的机器码推导 soinfo::next 偏移。
  *
- * 函数模式（所有 Android 版本一致）：
- *   ADRP Xp, <sonext_page>       // Xp = page register
- *   LDR  Xt, [Xp, #sonext_off]   // Xt = sonext (tail)
- *   STR  X0, [Xp, #sonext_off]   // sonext = si
- *   STR  X0, [Xt, #next_off]     // old_tail->next = si  ← 目标
- *   RET
+ * Android 14+ 的 solist_add_soinfo 有两条代码路径（CBNZ 分支）：
+ *   Path1 (空链表): ADRP→STR 全局变量→RET
+ *   Path2 (追加):   STR X0, [tail, #next_off]→STR 全局变量→RET
  *
- * 识别方法：找到 STR X0, [Rn, #off] 其中 Rn ≠ page_register。
+ * 关键特征：写入 soinfo::next 的 STR 偏移最小（结构体字段 < 256），
+ * 而写入全局变量的 STR 使用页相对偏移（通常 > 256）。
+ *
+ * 策略：扫描所有指令（不在 RET 处停止），在所有 STR X0, [Rn, #off]
+ * 中取最小非零偏移。
  */
 static int derive_next_offset(uint64_t fn_addr) {
     uint32_t *insns = (uint32_t *)fn_addr;
-    int page_reg = -1;
-    int next_offset = -1;
+    int best_offset = -1;
+    int ret_count = 0;
 
-    for (int i = 0; i < 12; i++) {
+    for (int i = 0; i < 16; i++) {
         uint32_t insn = insns[i];
 
-        /* RET = 0xd65f03c0 */
-        if (insn == 0xd65f03c0)
-            break;
-
-        /* ADRP: bit[31]=x, bits[28:24]=10000 → mask 0x9F000000 == 0x90000000 */
-        if ((insn & 0x9F000000) == 0x90000000) {
-            page_reg = insn & 0x1F;
+        /* 遇到第二个 RET 时停止（覆盖两条路径） */
+        if (insn == 0xd65f03c0) {
+            if (++ret_count >= 2)
+                break;
             continue;
         }
 
@@ -218,15 +216,17 @@ static int derive_next_offset(uint64_t fn_addr) {
          * 固定位: 0xFFC00000 == 0xF9000000 */
         if ((insn & 0xFFC00000) == 0xF9000000) {
             int rt = insn & 0x1F;
-            int rn = (insn >> 5) & 0x1F;
-            if (rt == 0 && rn != page_reg) {
+            if (rt == 0) {
                 int imm12 = (insn >> 10) & 0xFFF;
-                next_offset = imm12 * 8;
+                int off = imm12 * 8;
+                if (off > 0 && (best_offset < 0 || off < best_offset)) {
+                    best_offset = off;
+                }
             }
         }
     }
 
-    return next_offset;
+    return best_offset;
 }
 
 /* ========== .init_array constructor ========== */

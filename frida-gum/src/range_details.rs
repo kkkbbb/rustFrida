@@ -5,10 +5,7 @@
  * Licence: wxWindows Library Licence, Version 3.1
  */
 
-#![cfg_attr(
-    any(target_arch = "x86_64", target_arch = "x86"),
-    allow(clippy::unnecessary_cast)
-)]
+#![cfg_attr(any(target_arch = "x86_64", target_arch = "x86"), allow(clippy::unnecessary_cast))]
 
 extern crate alloc;
 use {
@@ -32,10 +29,9 @@ pub enum PageProtection {
     Read = gum_sys::_GumPageProtection_GUM_PAGE_READ as u32,
     Write = gum_sys::_GumPageProtection_GUM_PAGE_WRITE as u32,
     Execute = gum_sys::_GumPageProtection_GUM_PAGE_EXECUTE as u32,
-    ReadWrite = gum_sys::_GumPageProtection_GUM_PAGE_READ as u32
-        | gum_sys::_GumPageProtection_GUM_PAGE_WRITE as u32,
-    ReadExecute = gum_sys::_GumPageProtection_GUM_PAGE_READ as u32
-        | gum_sys::_GumPageProtection_GUM_PAGE_EXECUTE as u32,
+    ReadWrite = gum_sys::_GumPageProtection_GUM_PAGE_READ as u32 | gum_sys::_GumPageProtection_GUM_PAGE_WRITE as u32,
+    ReadExecute =
+        gum_sys::_GumPageProtection_GUM_PAGE_READ as u32 | gum_sys::_GumPageProtection_GUM_PAGE_EXECUTE as u32,
     ReadWriteExecute = gum_sys::_GumPageProtection_GUM_PAGE_READ as u32
         | gum_sys::_GumPageProtection_GUM_PAGE_WRITE as u32
         | gum_sys::_GumPageProtection_GUM_PAGE_EXECUTE as u32,
@@ -117,13 +113,8 @@ unsafe extern "C" fn save_range_details_by_address(
     1
 }
 
-unsafe extern "C" fn enumerate_ranges_stub(
-    details: *const gum_sys::GumRangeDetails,
-    context: *mut c_void,
-) -> i32 {
-    if !(*(context as *mut Box<&mut dyn FnMut(&RangeDetails) -> bool>))(&RangeDetails::from_raw(
-        details,
-    )) {
+unsafe extern "C" fn enumerate_ranges_stub(details: *const gum_sys::GumRangeDetails, context: *mut c_void) -> i32 {
+    if !(*(context as *mut Box<&mut dyn FnMut(&RangeDetails) -> bool>))(&RangeDetails::from_raw(details)) {
         return 0;
     }
     1
@@ -151,10 +142,7 @@ impl<'a> RangeDetails<'a> {
 
     /// Get a [`RangeDetails`] for the range containing the given address.
     pub fn with_address(address: u64) -> Option<RangeDetails<'a>> {
-        let mut context = SaveRangeDetailsByAddressContext {
-            address,
-            details: None,
-        };
+        let mut context = SaveRangeDetailsByAddressContext { address, details: None };
         unsafe {
             gum_sys::gum_process_enumerate_ranges(
                 gum_sys::_GumPageProtection_GUM_PAGE_NO_ACCESS as u32,
@@ -168,10 +156,7 @@ impl<'a> RangeDetails<'a> {
 
     /// Enumerate all ranges which match the given [`PageProtection`], calling the callback
     /// function for each such range.
-    pub fn enumerate_with_prot(
-        prot: PageProtection,
-        callback: &mut dyn FnMut(&RangeDetails) -> bool,
-    ) {
+    pub fn enumerate_with_prot(prot: PageProtection, callback: &mut dyn FnMut(&RangeDetails) -> bool) {
         unsafe {
             gum_sys::gum_process_enumerate_ranges(
                 prot as u32,

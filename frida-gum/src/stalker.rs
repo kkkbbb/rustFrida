@@ -146,9 +146,7 @@ impl Stalker {
         assert!(Self::is_supported(gum));
 
         Stalker {
-            stalker: unsafe {
-                frida_gum_sys::gum_stalker_new_with_params(ic_entries, adjacent_blocks)
-            },
+            stalker: unsafe { frida_gum_sys::gum_stalker_new_with_params(ic_entries, adjacent_blocks) },
             _gum: gum.clone(),
         }
     }
@@ -204,12 +202,7 @@ impl Stalker {
     /// periodically.
     #[cfg(feature = "event-sink")]
     #[cfg_attr(docsrs, doc(cfg(feature = "event-sink")))]
-    pub fn follow<S: EventSink>(
-        &mut self,
-        thread_id: usize,
-        transformer: &Transformer,
-        event_sink: Option<&mut S>,
-    ) {
+    pub fn follow<S: EventSink>(&mut self, thread_id: usize, transformer: &Transformer, event_sink: Option<&mut S>) {
         use frida_gum_sys::GumThreadId;
 
         let sink = if let Some(sink) = event_sink {
@@ -218,14 +211,7 @@ impl Stalker {
             core::ptr::null_mut()
         };
 
-        unsafe {
-            gum_sys::gum_stalker_follow(
-                self.stalker,
-                thread_id as GumThreadId,
-                transformer.transformer,
-                sink,
-            )
-        };
+        unsafe { gum_sys::gum_stalker_follow(self.stalker, thread_id as GumThreadId, transformer.transformer, sink) };
     }
 
     /// Begin the Stalker on the current thread.
@@ -236,11 +222,7 @@ impl Stalker {
     /// periodically.
     #[cfg(feature = "event-sink")]
     #[cfg_attr(docsrs, doc(cfg(feature = "event-sink")))]
-    pub fn follow_me<S: EventSink>(
-        &mut self,
-        transformer: &Transformer,
-        event_sink: Option<&mut S>,
-    ) {
+    pub fn follow_me<S: EventSink>(&mut self, transformer: &Transformer, event_sink: Option<&mut S>) {
         let sink = if let Some(sink) = event_sink {
             event_sink_transform(sink)
         } else {
@@ -259,13 +241,7 @@ impl Stalker {
     #[cfg(not(feature = "event-sink"))]
     #[cfg_attr(docsrs, doc(cfg(not(feature = "event-sink"))))]
     pub fn follow_me(&mut self, transformer: &Transformer) {
-        unsafe {
-            gum_sys::gum_stalker_follow_me(
-                self.stalker,
-                transformer.transformer,
-                core::ptr::null_mut(),
-            )
-        };
+        unsafe { gum_sys::gum_stalker_follow_me(self.stalker, transformer.transformer, core::ptr::null_mut()) };
     }
 
     /// Stop stalking the specific thread.

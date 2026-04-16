@@ -6,9 +6,9 @@ use {
         slice::from_raw_parts,
     },
     frida_gum_sys::{
-        gchar, gpointer, gsize, gum_script_backend_create_finish, gum_script_load,
-        gum_script_load_finish, gum_script_set_message_handler, GAsyncResult, GBytes, GCancellable,
-        GError, GObject, GumScript, GumScriptBackend,
+        gchar, gpointer, gsize, gum_script_backend_create_finish, gum_script_load, gum_script_load_finish,
+        gum_script_set_message_handler, GAsyncResult, GBytes, GCancellable, GError, GObject, GumScript,
+        GumScriptBackend,
     },
 };
 
@@ -74,12 +74,7 @@ where
             return Ok(&[]);
         }
 
-        let bytes = unsafe {
-            from_raw_parts(
-                data,
-                size.try_into().map_err(|_e| Error::FailedToReadBytes)?,
-            )
-        };
+        let bytes = unsafe { from_raw_parts(data, size.try_into().map_err(|_e| Error::FailedToReadBytes)?) };
         Ok(bytes)
     }
 
@@ -96,11 +91,7 @@ where
         }
     }
 
-    unsafe extern "C" fn load_cb(
-        _source_object: *mut GObject,
-        result: *mut GAsyncResult,
-        user_data: gpointer,
-    ) {
+    unsafe extern "C" fn load_cb(_source_object: *mut GObject, result: *mut GAsyncResult, user_data: gpointer) {
         let data = &mut *(user_data as *mut ScriptData<F>);
         gum_script_load_finish(data.script, result);
         data.result = Ok(());

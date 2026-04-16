@@ -6,8 +6,8 @@ use {
     },
     core::{ffi::c_void, pin::Pin, ptr::null_mut},
     frida_gum_sys::{
-        gum_script_backend_create, gum_script_backend_obtain_qjs, gum_script_backend_obtain_v8,
-        GBytes, GCancellable, GumScriptBackend,
+        gum_script_backend_create, gum_script_backend_obtain_qjs, gum_script_backend_obtain_v8, GBytes, GCancellable,
+        GumScriptBackend,
     },
 };
 

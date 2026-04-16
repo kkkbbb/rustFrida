@@ -19,10 +19,7 @@ pub struct StalkerIterator<'a> {
     phantom: PhantomData<&'a frida_gum_sys::GumStalkerIterator>,
 }
 
-extern "C" fn put_callout_callback(
-    cpu_context: *mut frida_gum_sys::GumCpuContext,
-    user_data: *mut c_void,
-) {
+extern "C" fn put_callout_callback(cpu_context: *mut frida_gum_sys::GumCpuContext, user_data: *mut c_void) {
     let mut f = unsafe { Box::from_raw(user_data as *mut Box<dyn FnMut(CpuContext)>) };
     f(CpuContext::from_raw(cpu_context));
     // Leak the box again, we want to destruct it in the data_destroy callback.
@@ -48,8 +45,8 @@ impl<'a> StalkerIterator<'a> {
 
     pub fn put_callout(&self, callout: impl FnMut(CpuContext)) {
         unsafe {
-            let user_data = Box::leak(Box::new(Box::new(callout) as Box<dyn FnMut(CpuContext)>))
-                as *mut _ as *mut c_void;
+            let user_data =
+                Box::leak(Box::new(Box::new(callout) as Box<dyn FnMut(CpuContext)>)) as *mut _ as *mut c_void;
 
             frida_gum_sys::gum_stalker_iterator_put_callout(
                 self.iterator,
@@ -74,10 +71,7 @@ pub struct Instruction<'a> {
 }
 
 impl<'a> Instruction<'a> {
-    fn from_raw(
-        parent: *mut frida_gum_sys::GumStalkerIterator,
-        instr: *const cs_insn,
-    ) -> Instruction<'a> {
+    fn from_raw(parent: *mut frida_gum_sys::GumStalkerIterator, instr: *const cs_insn) -> Instruction<'a> {
         Instruction {
             parent,
             instr: unsafe { Insn::from_raw(instr) },
@@ -91,8 +85,8 @@ impl<'a> Instruction<'a> {
 
     pub fn put_callout(&self, callout: impl FnMut(CpuContext)) {
         unsafe {
-            let user_data = Box::leak(Box::new(Box::new(callout) as Box<dyn FnMut(CpuContext)>))
-                as *mut _ as *mut c_void;
+            let user_data =
+                Box::leak(Box::new(Box::new(callout) as Box<dyn FnMut(CpuContext)>)) as *mut _ as *mut c_void;
 
             frida_gum_sys::gum_stalker_iterator_put_callout(
                 self.parent,
@@ -117,9 +111,7 @@ impl<'a> Iterator for StalkerIterator<'a> {
 
     fn next(&mut self) -> Option<Instruction<'a>> {
         let mut instr: *const cs_insn = core::ptr::null();
-        if unsafe { frida_gum_sys::gum_stalker_iterator_next(self.iterator, &mut instr as *mut _) }
-            != 0
-        {
+        if unsafe { frida_gum_sys::gum_stalker_iterator_next(self.iterator, &mut instr as *mut _) } != 0 {
             Some(Instruction::from_raw(self.iterator, instr))
         } else {
             None
@@ -160,12 +152,8 @@ extern "C" fn transformer_callback(
     output: *mut frida_gum_sys::GumStalkerOutput,
     user_data: *mut c_void,
 ) {
-    let mut f =
-        unsafe { Box::from_raw(user_data as *mut Box<dyn FnMut(StalkerIterator, StalkerOutput)>) };
-    f(
-        StalkerIterator::from_raw(iterator),
-        StalkerOutput::from_raw(output),
-    );
+    let mut f = unsafe { Box::from_raw(user_data as *mut Box<dyn FnMut(StalkerIterator, StalkerOutput)>) };
+    f(StalkerIterator::from_raw(iterator), StalkerOutput::from_raw(output));
     // Leak the box again, we want to destruct it in the data_destroy callback.
     //
     Box::leak(f);

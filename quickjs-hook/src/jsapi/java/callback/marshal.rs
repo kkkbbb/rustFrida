@@ -2,6 +2,18 @@
 // ARM64 JNI calling convention helpers
 // ============================================================================
 
+std::thread_local! {
+    /// 控制 marshal 是否强制返回 Java 对象 wrapper。为 true 时不做任何自动
+    /// 类型转换（String 不转 JS string、Integer/Long/... 不 unbox、容器不转
+    /// Array），用户拿到的一定是可以继续链式调用 Java 方法的 wrapper。
+    /// 目前只在 `Java.use(...).$new(...)` 中打开。
+    static RETURN_RAW_WRAPPER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(super) fn set_return_raw_wrapper(skip: bool) {
+    RETURN_RAW_WRAPPER.with(|c| c.set(skip));
+}
+
 /// 判断 JNI 类型签名是否表示浮点类型 (float/double)
 #[inline]
 fn is_floating_point_type(sig: Option<&str>) -> bool {
@@ -128,19 +140,7 @@ unsafe fn wrap_java_object_ref(
     wrap_java_object_value(ctx, global_ref as u64, class_name)
 }
 
-unsafe fn is_java_list_instance(env: JniEnv, obj: *mut std::ffi::c_void) -> bool {
-    if obj.is_null() {
-        return false;
-    }
-
-    let reflect = match REFLECT_IDS.get() {
-        Some(ids) if !ids.list_class.is_null() => ids,
-        _ => return false,
-    };
-    let is_instance_of: IsInstanceOfFn = jni_fn!(env, IsInstanceOfFn, JNI_IS_INSTANCE_OF);
-    is_instance_of(env, obj, reflect.list_class) != 0 && !jni_check_exc(env)
-}
-
+#[allow(dead_code)]
 unsafe fn try_unbox_boxed_primitive(
     ctx: *mut ffi::JSContext,
     env: JniEnv,
@@ -247,6 +247,15 @@ unsafe fn marshal_java_object_to_js_inner(
             .unwrap_or_else(|| "java.lang.Object".to_string())
     });
 
+    // `$new` 强制返回 wrapper：跳过 String/Boxed-primitive/容器的自动转换，
+    // 让 `Java.use("...").$new(...)` 一定返回可链式调用的 Java 对象代理。
+    if RETURN_RAW_WRAPPER.get() {
+        if release_local {
+            return wrap_java_object_ref(ctx, env, obj, &class_name, globalize_wrappers);
+        }
+        return wrap_java_object_value(ctx, obj as u64, &class_name);
+    }
+
     if class_name == "java.lang.String" {
         let get_str: GetStringUtfCharsFn = jni_fn!(env, GetStringUtfCharsFn, JNI_GET_STRING_UTF_CHARS);
         let rel_str: ReleaseStringUtfCharsFn =
@@ -268,33 +277,19 @@ unsafe fn marshal_java_object_to_js_inner(
         jni_check_exc(env);
     }
 
-    if let Some(value) = try_unbox_boxed_primitive(ctx, env, obj, &class_name, release_local) {
-        return value;
-    }
-
-    if depth < MAX_JAVA_CONTAINER_DEPTH {
-        if class_name.starts_with('[') {
-            if let Some(value) = convert_java_array_to_js(
-                ctx,
-                env,
-                obj,
-                release_local,
-                globalize_wrappers,
-                depth + 1,
-            ) {
-                return value;
-            }
-        } else if is_java_list_instance(env, obj) {
-            if let Some(value) = convert_java_list_to_js(
-                ctx,
-                env,
-                obj,
-                release_local,
-                globalize_wrappers,
-                depth + 1,
-            ) {
-                return value;
-            }
+    // Java 数组 → JS Array。List 与装箱原始值保留为 Java wrapper，
+    // 交给用户显式处理（可链式调 list.size()/list.get(i)、integer.intValue() 等）。
+    if depth < MAX_JAVA_CONTAINER_DEPTH && class_name.starts_with('[') {
+        if let Some(value) = convert_java_array_to_js(
+            ctx,
+            env,
+            obj,
+            &class_name,
+            release_local,
+            globalize_wrappers,
+            depth + 1,
+        ) {
+            return value;
         }
     }
 
@@ -305,36 +300,25 @@ unsafe fn marshal_java_object_to_js_inner(
     wrap_java_object_value(ctx, obj as u64, &class_name)
 }
 
+/// Java 数组 → JS Array。
+///
+/// 原始类型数组走 `Get<Type>ArrayRegion` 一次批量拷贝到 Rust 缓冲，无装箱、无
+/// Release；对象数组用 `GetObjectArrayElement` 直接取引用，递归 marshal。
+/// 绕开 `java.lang.reflect.Array` 反射路径。
 unsafe fn convert_java_array_to_js(
     ctx: *mut ffi::JSContext,
     env: JniEnv,
     array_obj: *mut std::ffi::c_void,
+    class_name: &str,
     release_local: bool,
     globalize_wrappers: bool,
     depth: usize,
 ) -> Option<ffi::JSValue> {
-    let reflect = REFLECT_IDS.get()?;
-    if reflect.array_class.is_null()
-        || reflect.array_get_length_mid.is_null()
-        || reflect.array_get_mid.is_null()
-    {
-        return None;
-    }
-
-    let call_static_int: CallStaticIntMethodAFn =
-        jni_fn!(env, CallStaticIntMethodAFn, JNI_CALL_STATIC_INT_METHOD_A);
-    let call_static_obj: CallStaticObjectMethodAFn =
-        jni_fn!(env, CallStaticObjectMethodAFn, JNI_CALL_STATIC_OBJECT_METHOD_A);
     let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
+    let get_len: GetArrayLengthFn = jni_fn!(env, GetArrayLengthFn, JNI_GET_ARRAY_LENGTH);
 
-    let len_args = [array_obj as u64];
-    let len = call_static_int(
-        env,
-        reflect.array_class,
-        reflect.array_get_length_mid,
-        len_args.as_ptr() as *const std::ffi::c_void,
-    );
-    if jni_check_exc(env) {
+    let len = get_len(env, array_obj);
+    if jni_check_exc(env) || len < 0 {
         if release_local {
             delete_local_ref(env, array_obj);
         }
@@ -342,101 +326,122 @@ unsafe fn convert_java_array_to_js(
     }
 
     let arr = ffi::JS_NewArray(ctx);
-    for i in 0..len.max(0) {
-        let elem_args = [array_obj as u64, i as u64];
-        let elem = call_static_obj(
-            env,
-            reflect.array_class,
-            reflect.array_get_mid,
-            elem_args.as_ptr() as *const std::ffi::c_void,
-        );
-        if jni_check_exc(env) {
-            if !elem.is_null() {
-                delete_local_ref(env, elem);
+    let elem_type = class_name.as_bytes().get(1).copied().unwrap_or(b'L');
+    let len_usize = len as usize;
+
+    // 原始类型 region 读取：一次 JNI 调用把整段元素拷到 Rust vec
+    macro_rules! read_region {
+        ($elem:ty, $init:expr, $fn_ty:ident, $idx:ident) => {{
+            let mut buf: Vec<$elem> = vec![$init; len_usize];
+            let f: $fn_ty = jni_fn!(env, $fn_ty, $idx);
+            f(env, array_obj, 0, len, buf.as_mut_ptr());
+            if jni_check_exc(env) {
+                if release_local {
+                    delete_local_ref(env, array_obj);
+                }
+                return None;
             }
+            buf
+        }};
+    }
+
+    match elem_type {
+        b'Z' => {
+            let buf = read_region!(u8, 0, GetBooleanArrayRegionFn, JNI_GET_BOOLEAN_ARRAY_REGION);
+            for i in 0..len_usize {
+                let v = JSValue::bool(buf[i] != 0).raw();
+                ffi::JS_SetPropertyUint32(ctx, arr, i as u32, v);
+            }
+        }
+        b'B' => {
+            let buf = read_region!(i8, 0, GetByteArrayRegionFn, JNI_GET_BYTE_ARRAY_REGION);
+            for i in 0..len_usize {
+                let v = JSValue::int(buf[i] as i32).raw();
+                ffi::JS_SetPropertyUint32(ctx, arr, i as u32, v);
+            }
+        }
+        b'C' => {
+            let buf = read_region!(u16, 0, GetCharArrayRegionFn, JNI_GET_CHAR_ARRAY_REGION);
+            for i in 0..len_usize {
+                let c = std::char::from_u32(buf[i] as u32)
+                    .unwrap_or('\0')
+                    .to_string();
+                let v = JSValue::string(ctx, &c).raw();
+                ffi::JS_SetPropertyUint32(ctx, arr, i as u32, v);
+            }
+        }
+        b'S' => {
+            let buf = read_region!(i16, 0, GetShortArrayRegionFn, JNI_GET_SHORT_ARRAY_REGION);
+            for i in 0..len_usize {
+                let v = JSValue::int(buf[i] as i32).raw();
+                ffi::JS_SetPropertyUint32(ctx, arr, i as u32, v);
+            }
+        }
+        b'I' => {
+            let buf = read_region!(i32, 0, GetIntArrayRegionFn, JNI_GET_INT_ARRAY_REGION);
+            for i in 0..len_usize {
+                let v = JSValue::int(buf[i]).raw();
+                ffi::JS_SetPropertyUint32(ctx, arr, i as u32, v);
+            }
+        }
+        b'J' => {
+            let buf = read_region!(i64, 0, GetLongArrayRegionFn, JNI_GET_LONG_ARRAY_REGION);
+            for i in 0..len_usize {
+                let v = ffi::JS_NewBigInt64(ctx, buf[i]);
+                ffi::JS_SetPropertyUint32(ctx, arr, i as u32, v);
+            }
+        }
+        b'F' => {
+            let buf = read_region!(f32, 0.0, GetFloatArrayRegionFn, JNI_GET_FLOAT_ARRAY_REGION);
+            for i in 0..len_usize {
+                let v = JSValue::float(buf[i] as f64).raw();
+                ffi::JS_SetPropertyUint32(ctx, arr, i as u32, v);
+            }
+        }
+        b'D' => {
+            let buf = read_region!(f64, 0.0, GetDoubleArrayRegionFn, JNI_GET_DOUBLE_ARRAY_REGION);
+            for i in 0..len_usize {
+                let v = JSValue::float(buf[i]).raw();
+                ffi::JS_SetPropertyUint32(ctx, arr, i as u32, v);
+            }
+        }
+        b'L' | b'[' => {
+            // 对象 / 嵌套数组：逐个取引用，递归 marshal
+            let get_elem: GetObjectArrayElementFn =
+                jni_fn!(env, GetObjectArrayElementFn, JNI_GET_OBJECT_ARRAY_ELEMENT);
+            for i in 0..len {
+                let elem = get_elem(env, array_obj, i);
+                if jni_check_exc(env) {
+                    if !elem.is_null() {
+                        delete_local_ref(env, elem);
+                    }
+                    if release_local {
+                        delete_local_ref(env, array_obj);
+                    }
+                    return None;
+                }
+                let value = marshal_java_object_to_js_inner(
+                    ctx,
+                    env,
+                    elem,
+                    None,
+                    true,
+                    globalize_wrappers,
+                    depth,
+                );
+                ffi::JS_SetPropertyUint32(ctx, arr, i as u32, value);
+            }
+        }
+        _ => {
             if release_local {
                 delete_local_ref(env, array_obj);
             }
             return None;
         }
-
-        let value = marshal_java_object_to_js_inner(
-            ctx,
-            env,
-            elem,
-            None,
-            true,
-            globalize_wrappers,
-            depth,
-        );
-        ffi::JS_SetPropertyUint32(ctx, arr, i as u32, value);
     }
 
     if release_local {
         delete_local_ref(env, array_obj);
-    }
-
-    Some(arr)
-}
-
-unsafe fn convert_java_list_to_js(
-    ctx: *mut ffi::JSContext,
-    env: JniEnv,
-    list_obj: *mut std::ffi::c_void,
-    release_local: bool,
-    globalize_wrappers: bool,
-    depth: usize,
-) -> Option<ffi::JSValue> {
-    let reflect = REFLECT_IDS.get()?;
-    if reflect.list_size_mid.is_null() || reflect.list_get_mid.is_null() {
-        return None;
-    }
-
-    let call_int: CallIntMethodAFn = jni_fn!(env, CallIntMethodAFn, JNI_CALL_INT_METHOD_A);
-    let call_obj: CallObjectMethodAFn = jni_fn!(env, CallObjectMethodAFn, JNI_CALL_OBJECT_METHOD_A);
-    let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
-
-    let len = call_int(env, list_obj, reflect.list_size_mid, std::ptr::null());
-    if jni_check_exc(env) {
-        if release_local {
-            delete_local_ref(env, list_obj);
-        }
-        return None;
-    }
-
-    let arr = ffi::JS_NewArray(ctx);
-    for i in 0..len.max(0) {
-        let elem_args = [i as u64];
-        let elem = call_obj(
-            env,
-            list_obj,
-            reflect.list_get_mid,
-            elem_args.as_ptr() as *const std::ffi::c_void,
-        );
-        if jni_check_exc(env) {
-            if !elem.is_null() {
-                delete_local_ref(env, elem);
-            }
-            if release_local {
-                delete_local_ref(env, list_obj);
-            }
-            return None;
-        }
-
-        let value = marshal_java_object_to_js_inner(
-            ctx,
-            env,
-            elem,
-            None,
-            true,
-            globalize_wrappers,
-            depth,
-        );
-        ffi::JS_SetPropertyUint32(ctx, arr, i as u32, value);
-    }
-
-    if release_local {
-        delete_local_ref(env, list_obj);
     }
 
     Some(arr)

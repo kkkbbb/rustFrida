@@ -6,7 +6,7 @@
 //! - method and field resolution/cache
 //! - instrumentation and runtime probing
 
-use crate::jsapi::console::output_message;
+use crate::jsapi::console::output_verbose;
 use crate::jsapi::module::{dlsym_first_match, is_in_libart, libart_dlsym};
 use std::collections::HashMap;
 use std::ffi::CString;

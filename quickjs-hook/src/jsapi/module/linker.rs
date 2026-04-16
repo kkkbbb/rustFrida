@@ -52,8 +52,9 @@ unsafe fn init_unrestricted_linker_api() -> Option<UnrestrictedLinkerApi> {
             "__dl__Z8__dlopenPKciPKv",
             "__dl__Z8__dlvsymPvPKcS1_PKv",
             // Linker internals (Frida's gum_store_linker_symbol_if_needed)
-            "__dl__ZL10g_dl_mutex",
-            "__dl__ZL8gDlMutex", // < API 21
+            "__dl_g_dl_mutex",       // API 24+ (extern "C", no mangling)
+            "__dl__ZL10g_dl_mutex",  // API 21-23 (C++ internal linkage)
+            "__dl__ZL8gDlMutex",     // < API 21
             "__dl__Z15solist_get_headv",
             "__dl__ZL6solist",
             "__dl__ZNK6soinfo12get_realpathEv",
@@ -107,7 +108,8 @@ unsafe fn init_unrestricted_linker_api() -> Option<UnrestrictedLinkerApi> {
 
     // Extract optional linker internals
     let dl_mutex = symbols
-        .get("__dl__ZL10g_dl_mutex")
+        .get("__dl_g_dl_mutex")
+        .or_else(|| symbols.get("__dl__ZL10g_dl_mutex"))
         .or_else(|| symbols.get("__dl__ZL8gDlMutex"))
         .map(|&addr| addr as *mut libc::pthread_mutex_t)
         .unwrap_or_else(|| {

@@ -3,7 +3,7 @@
 //! Contains: ArtMethod layout constants, JNI type aliases, function table helpers,
 //! entry_point offset probing, JNI state management.
 
-use crate::jsapi::console::output_message;
+use crate::jsapi::console::output_verbose;
 use crate::jsapi::module::probe_module_range;
 use std::ffi::CString;
 use std::os::raw::c_char;
@@ -79,204 +79,129 @@ pub(super) fn k_acc_compile_dont_bother() -> u32 {
 pub(crate) type JniEnv = *mut *const *const std::ffi::c_void;
 
 pub(super) type FindClassFn = unsafe extern "C" fn(JniEnv, *const c_char) -> *mut std::ffi::c_void;
-pub(super) type GetMethodIdFn = unsafe extern "C" fn(
-    JniEnv,
-    *mut std::ffi::c_void,
-    *const c_char,
-    *const c_char,
-) -> *mut std::ffi::c_void;
-pub(super) type GetStaticMethodIdFn = unsafe extern "C" fn(
-    JniEnv,
-    *mut std::ffi::c_void,
-    *const c_char,
-    *const c_char,
-) -> *mut std::ffi::c_void;
+pub(super) type GetMethodIdFn =
+    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *const c_char, *const c_char) -> *mut std::ffi::c_void;
+pub(super) type GetStaticMethodIdFn =
+    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *const c_char, *const c_char) -> *mut std::ffi::c_void;
 pub(super) type ExcCheckFn = unsafe extern "C" fn(JniEnv) -> u8;
 pub(super) type ExcClearFn = unsafe extern "C" fn(JniEnv);
+pub(super) type ExcOccurredFn = unsafe extern "C" fn(JniEnv) -> *mut std::ffi::c_void;
 pub(super) type DeleteLocalRefFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void);
-pub(super) type NewLocalRefFn =
-    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void) -> *mut std::ffi::c_void;
-pub(super) type NewGlobalRefFn =
-    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+pub(super) type NewLocalRefFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+pub(super) type NewGlobalRefFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void) -> *mut std::ffi::c_void;
 pub(super) type DeleteGlobalRefFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void);
-pub(super) type GetObjectClassFn =
-    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void) -> *mut std::ffi::c_void;
-pub(super) type GetSuperclassFn =
-    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void) -> *mut std::ffi::c_void;
-pub(super) type IsSameObjectFn =
-    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void) -> u8;
+pub(super) type MonitorEnterFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void) -> i32;
+pub(super) type MonitorExitFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void) -> i32;
+pub(super) type GetObjectClassFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+pub(super) type GetSuperclassFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+pub(super) type IsSameObjectFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void) -> u8;
 pub(super) type NewObjectAFn = unsafe extern "C" fn(
     JniEnv,
     *mut std::ffi::c_void,
     *mut std::ffi::c_void,
     *const std::ffi::c_void,
 ) -> *mut std::ffi::c_void;
-pub(super) type IsInstanceOfFn =
-    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void) -> u8;
-pub(super) type GetFieldIdFn = unsafe extern "C" fn(
-    JniEnv,
-    *mut std::ffi::c_void,
-    *const c_char,
-    *const c_char,
-) -> *mut std::ffi::c_void;
-pub(super) type NewStringUtfFn =
-    unsafe extern "C" fn(JniEnv, *const c_char) -> *mut std::ffi::c_void;
-pub(super) type GetStringUtfCharsFn =
-    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut u8) -> *const c_char;
-pub(super) type ReleaseStringUtfCharsFn =
-    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *const c_char);
+pub(super) type IsInstanceOfFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void) -> u8;
+pub(super) type GetFieldIdFn =
+    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *const c_char, *const c_char) -> *mut std::ffi::c_void;
+pub(super) type NewStringUtfFn = unsafe extern "C" fn(JniEnv, *const c_char) -> *mut std::ffi::c_void;
+pub(super) type GetStringUtfCharsFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut u8) -> *const c_char;
+pub(super) type ReleaseStringUtfCharsFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *const c_char);
 pub(super) type PushLocalFrameFn = unsafe extern "C" fn(JniEnv, i32) -> i32;
-pub(super) type PopLocalFrameFn =
-    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+pub(super) type PopLocalFrameFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void) -> *mut std::ffi::c_void;
 pub(super) type GetArrayLengthFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void) -> i32;
 pub(super) type GetObjectArrayElementFn =
     unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, i32) -> *mut std::ffi::c_void;
+pub(super) type GetBooleanArrayRegionFn =
+    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, i32, i32, *mut u8);
+pub(super) type GetByteArrayRegionFn =
+    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, i32, i32, *mut i8);
+pub(super) type GetCharArrayRegionFn =
+    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, i32, i32, *mut u16);
+pub(super) type GetShortArrayRegionFn =
+    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, i32, i32, *mut i16);
+pub(super) type GetIntArrayRegionFn =
+    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, i32, i32, *mut i32);
+pub(super) type GetLongArrayRegionFn =
+    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, i32, i32, *mut i64);
+pub(super) type GetFloatArrayRegionFn =
+    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, i32, i32, *mut f32);
+pub(super) type GetDoubleArrayRegionFn =
+    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, i32, i32, *mut f64);
 pub(super) type CallObjectMethodAFn = unsafe extern "C" fn(
     JniEnv,
     *mut std::ffi::c_void,
     *mut std::ffi::c_void,
     *const std::ffi::c_void,
 ) -> *mut std::ffi::c_void;
-pub(super) type CallBooleanMethodAFn = unsafe extern "C" fn(
-    JniEnv,
-    *mut std::ffi::c_void,
-    *mut std::ffi::c_void,
-    *const std::ffi::c_void,
-) -> u8;
-pub(super) type CallByteMethodAFn = unsafe extern "C" fn(
-    JniEnv,
-    *mut std::ffi::c_void,
-    *mut std::ffi::c_void,
-    *const std::ffi::c_void,
-) -> i8;
-pub(super) type CallCharMethodAFn = unsafe extern "C" fn(
-    JniEnv,
-    *mut std::ffi::c_void,
-    *mut std::ffi::c_void,
-    *const std::ffi::c_void,
-) -> u16;
-pub(super) type CallShortMethodAFn = unsafe extern "C" fn(
-    JniEnv,
-    *mut std::ffi::c_void,
-    *mut std::ffi::c_void,
-    *const std::ffi::c_void,
-) -> i16;
+pub(super) type CallBooleanMethodAFn =
+    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void, *const std::ffi::c_void) -> u8;
+pub(super) type CallByteMethodAFn =
+    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void, *const std::ffi::c_void) -> i8;
+pub(super) type CallCharMethodAFn =
+    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void, *const std::ffi::c_void) -> u16;
+pub(super) type CallShortMethodAFn =
+    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void, *const std::ffi::c_void) -> i16;
 pub(super) type CallStaticObjectMethodAFn = unsafe extern "C" fn(
     JniEnv,
     *mut std::ffi::c_void,
     *mut std::ffi::c_void,
     *const std::ffi::c_void,
 ) -> *mut std::ffi::c_void;
-pub(super) type CallStaticIntMethodAFn = unsafe extern "C" fn(
-    JniEnv,
-    *mut std::ffi::c_void,
-    *mut std::ffi::c_void,
-    *const std::ffi::c_void,
-) -> i32;
-pub(super) type CallIntMethodAFn = unsafe extern "C" fn(
-    JniEnv,
-    *mut std::ffi::c_void,
-    *mut std::ffi::c_void,
-    *const std::ffi::c_void,
-) -> i32;
-pub(super) type CallLongMethodAFn = unsafe extern "C" fn(
-    JniEnv,
-    *mut std::ffi::c_void,
-    *mut std::ffi::c_void,
-    *const std::ffi::c_void,
-) -> i64;
-pub(super) type CallFloatMethodAFn = unsafe extern "C" fn(
-    JniEnv,
-    *mut std::ffi::c_void,
-    *mut std::ffi::c_void,
-    *const std::ffi::c_void,
-) -> f32;
-pub(super) type CallDoubleMethodAFn = unsafe extern "C" fn(
-    JniEnv,
-    *mut std::ffi::c_void,
-    *mut std::ffi::c_void,
-    *const std::ffi::c_void,
-) -> f64;
-pub(super) type ToReflectedMethodFn = unsafe extern "C" fn(
-    JniEnv,
-    *mut std::ffi::c_void,
-    *mut std::ffi::c_void,
-    u8,
-) -> *mut std::ffi::c_void;
+pub(super) type CallStaticIntMethodAFn =
+    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void, *const std::ffi::c_void) -> i32;
+pub(super) type CallIntMethodAFn =
+    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void, *const std::ffi::c_void) -> i32;
+pub(super) type CallLongMethodAFn =
+    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void, *const std::ffi::c_void) -> i64;
+pub(super) type CallFloatMethodAFn =
+    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void, *const std::ffi::c_void) -> f32;
+pub(super) type CallDoubleMethodAFn =
+    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void, *const std::ffi::c_void) -> f64;
+pub(super) type ToReflectedMethodFn =
+    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void, u8) -> *mut std::ffi::c_void;
 #[allow(dead_code)]
-pub(super) type ToReflectedFieldFn = unsafe extern "C" fn(
-    JniEnv,
-    *mut std::ffi::c_void,
-    *mut std::ffi::c_void,
-    u8,
-) -> *mut std::ffi::c_void;
-pub(super) type GetLongFieldFn =
-    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void) -> i64;
-pub(super) type GetBooleanFieldFn =
-    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void) -> u8;
-pub(super) type GetByteFieldFn =
-    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void) -> i8;
-pub(super) type GetCharFieldFn =
-    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void) -> u16;
-pub(super) type GetShortFieldFn =
-    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void) -> i16;
-pub(super) type GetIntFieldFn =
-    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void) -> i32;
-pub(super) type GetFloatFieldFn =
-    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void) -> f32;
-pub(super) type GetDoubleFieldFn =
-    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void) -> f64;
-pub(super) type GetObjectFieldFn = unsafe extern "C" fn(
-    JniEnv,
-    *mut std::ffi::c_void,
-    *mut std::ffi::c_void,
-) -> *mut std::ffi::c_void;
+pub(super) type ToReflectedFieldFn =
+    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void, u8) -> *mut std::ffi::c_void;
+pub(super) type GetLongFieldFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void) -> i64;
+pub(super) type GetBooleanFieldFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void) -> u8;
+pub(super) type GetByteFieldFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void) -> i8;
+pub(super) type GetCharFieldFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void) -> u16;
+pub(super) type GetShortFieldFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void) -> i16;
+pub(super) type GetIntFieldFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void) -> i32;
+pub(super) type GetFloatFieldFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void) -> f32;
+pub(super) type GetDoubleFieldFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void) -> f64;
+pub(super) type GetObjectFieldFn =
+    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void) -> *mut std::ffi::c_void;
 
 // Void method call (instance)
-pub(super) type CallVoidMethodAFn = unsafe extern "C" fn(
-    JniEnv,
-    *mut std::ffi::c_void,
-    *mut std::ffi::c_void,
-    *const std::ffi::c_void,
-);
+pub(super) type CallVoidMethodAFn =
+    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void, *const std::ffi::c_void);
 // Object array creation/mutation
-pub(super) type NewObjectArrayFn = unsafe extern "C" fn(
-    JniEnv,
-    i32,
-    *mut std::ffi::c_void,
-    *mut std::ffi::c_void,
-) -> *mut std::ffi::c_void;
+pub(super) type NewObjectArrayFn =
+    unsafe extern "C" fn(JniEnv, i32, *mut std::ffi::c_void, *mut std::ffi::c_void) -> *mut std::ffi::c_void;
 pub(super) type SetObjectArrayElementFn =
     unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, i32, *mut std::ffi::c_void);
 
 // Static field getter types (signature: env, cls, fid → value)
-pub(super) type GetStaticFieldIdFn = unsafe extern "C" fn(
-    JniEnv,
-    *mut std::ffi::c_void,
-    *const c_char,
-    *const c_char,
-) -> *mut std::ffi::c_void;
+pub(super) type GetStaticFieldIdFn =
+    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *const c_char, *const c_char) -> *mut std::ffi::c_void;
 pub(super) type GetStaticBooleanFieldFn =
     unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void) -> u8;
-pub(super) type GetStaticByteFieldFn =
-    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void) -> i8;
+pub(super) type GetStaticByteFieldFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void) -> i8;
 pub(super) type GetStaticCharFieldFn =
     unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void) -> u16;
 pub(super) type GetStaticShortFieldFn =
     unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void) -> i16;
-pub(super) type GetStaticIntFieldFn =
-    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void) -> i32;
+pub(super) type GetStaticIntFieldFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void) -> i32;
 pub(super) type GetStaticLongFieldFn =
     unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void) -> i64;
 pub(super) type GetStaticFloatFieldFn =
     unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void) -> f32;
 pub(super) type GetStaticDoubleFieldFn =
     unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void) -> f64;
-pub(super) type GetStaticObjectFieldFn = unsafe extern "C" fn(
-    JniEnv,
-    *mut std::ffi::c_void,
-    *mut std::ffi::c_void,
-) -> *mut std::ffi::c_void;
+pub(super) type GetStaticObjectFieldFn =
+    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void) -> *mut std::ffi::c_void;
 
 /// Call a JNI function from the function table by index.
 /// JNIEnv is `JNINativeInterface**` — (*env)[index] is the function pointer.
@@ -297,6 +222,125 @@ pub(super) unsafe fn jni_check_exc(env: JniEnv) -> bool {
     } else {
         false
     }
+}
+
+/// Check for a pending JNI exception and extract its toString() + cause chain
+/// as a human-readable string. Always clears the exception on return.
+///
+/// Returns `Some(msg)` if there was an exception, `None` otherwise.
+///
+/// Format: `"<ClassName>: <message> [caused by: ...]"`
+///
+/// Safe to call during hook callbacks — only uses JNI FindClass/GetMethodID/
+/// CallObjectMethod (no WalkStack). Bounded recursion depth (3 levels) on
+/// cause chain to avoid infinite loops from self-referencing causes.
+pub(super) unsafe fn jni_take_exception(env: JniEnv) -> Option<String> {
+    let check: ExcCheckFn = jni_fn!(env, ExcCheckFn, JNI_EXCEPTION_CHECK);
+    if check(env) == 0 {
+        return None;
+    }
+
+    let occurred: ExcOccurredFn = jni_fn!(env, ExcOccurredFn, JNI_EXCEPTION_OCCURRED);
+    let throwable = occurred(env);
+
+    // 必须先 clear 才能对 throwable 调用其它 JNI 方法
+    let clear: ExcClearFn = jni_fn!(env, ExcClearFn, JNI_EXCEPTION_CLEAR);
+    clear(env);
+
+    if throwable.is_null() {
+        return Some("<null throwable>".to_string());
+    }
+
+    let msg = format_throwable_chain(env, throwable, 0);
+
+    let delete: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
+    delete(env, throwable);
+
+    Some(msg)
+}
+
+/// 递归提取 throwable 的 toString() + cause 链。depth 上限 3 层。
+unsafe fn format_throwable_chain(env: JniEnv, throwable: *mut std::ffi::c_void, depth: usize) -> String {
+    if throwable.is_null() {
+        return "<null>".to_string();
+    }
+
+    // 查找 java.lang.Throwable（缓存下来也行，但单次开销可接受）
+    let find_class: FindClassFn = jni_fn!(env, FindClassFn, JNI_FIND_CLASS);
+    let get_mid: GetMethodIdFn = jni_fn!(env, GetMethodIdFn, JNI_GET_METHOD_ID);
+    let call_obj: CallObjectMethodAFn = jni_fn!(env, CallObjectMethodAFn, JNI_CALL_OBJECT_METHOD_A);
+    let get_chars: GetStringUtfCharsFn = jni_fn!(env, GetStringUtfCharsFn, JNI_GET_STRING_UTF_CHARS);
+    let rel_chars: ReleaseStringUtfCharsFn = jni_fn!(env, ReleaseStringUtfCharsFn, JNI_RELEASE_STRING_UTF_CHARS);
+    let delete: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
+
+    let throwable_cls_name = CString::new("java/lang/Throwable").unwrap();
+    let throwable_cls = find_class(env, throwable_cls_name.as_ptr());
+    // 必须捕获 FindClass 可能的异常
+    let check: ExcCheckFn = jni_fn!(env, ExcCheckFn, JNI_EXCEPTION_CHECK);
+    if check(env) != 0 {
+        clear_exc(env);
+    }
+    if throwable_cls.is_null() {
+        return "<Throwable class not found>".to_string();
+    }
+
+    let to_string_name = CString::new("toString").unwrap();
+    let to_string_sig = CString::new("()Ljava/lang/String;").unwrap();
+    let to_string_mid = get_mid(env, throwable_cls, to_string_name.as_ptr(), to_string_sig.as_ptr());
+    if check(env) != 0 {
+        clear_exc(env);
+    }
+
+    let get_cause_name = CString::new("getCause").unwrap();
+    let get_cause_sig = CString::new("()Ljava/lang/Throwable;").unwrap();
+    let get_cause_mid = get_mid(env, throwable_cls, get_cause_name.as_ptr(), get_cause_sig.as_ptr());
+    if check(env) != 0 {
+        clear_exc(env);
+    }
+
+    let mut result = String::new();
+
+    if !to_string_mid.is_null() {
+        let jstr = call_obj(env, throwable, to_string_mid, std::ptr::null());
+        if check(env) != 0 {
+            clear_exc(env);
+            result.push_str("<toString threw>");
+        } else if !jstr.is_null() {
+            let chars = get_chars(env, jstr, std::ptr::null_mut());
+            if !chars.is_null() {
+                result.push_str(&std::ffi::CStr::from_ptr(chars).to_string_lossy());
+                rel_chars(env, jstr, chars);
+            }
+            delete(env, jstr);
+        }
+    } else {
+        result.push_str("<toString mid not found>");
+    }
+
+    // 递归提取 cause（最多 3 层，防止循环引用）
+    const MAX_CAUSE_DEPTH: usize = 3;
+    if depth < MAX_CAUSE_DEPTH && !get_cause_mid.is_null() {
+        let cause = call_obj(env, throwable, get_cause_mid, std::ptr::null());
+        if check(env) != 0 {
+            clear_exc(env);
+        } else if !cause.is_null() {
+            let cause_msg = format_throwable_chain(env, cause, depth + 1);
+            result.push_str("\n  Caused by: ");
+            result.push_str(&cause_msg);
+            delete(env, cause);
+        }
+    } else if depth >= MAX_CAUSE_DEPTH {
+        result.push_str("\n  Caused by: <truncated>");
+    }
+
+    delete(env, throwable_cls);
+    result
+}
+
+#[inline]
+unsafe fn clear_exc(env: JniEnv) {
+    let clear: ExcClearFn = jni_fn!(env, ExcClearFn, JNI_EXCEPTION_CLEAR);
+    clear(env);
 }
 
 /// Check if a 64-bit value looks like a valid ARM64 code pointer.
@@ -329,8 +373,7 @@ unsafe fn read_system_property(name: &str, buf: &mut [u8]) {
     if sym.is_null() {
         return;
     }
-    let get_prop: unsafe extern "C" fn(*const c_char, *mut c_char) -> i32 =
-        std::mem::transmute(sym);
+    let get_prop: unsafe extern "C" fn(*const c_char, *mut c_char) -> i32 = std::mem::transmute(sym);
     get_prop(prop.as_ptr(), buf.as_mut_ptr() as *mut c_char);
 }
 
@@ -372,16 +415,12 @@ fn probe_art_method_spec(env: JniEnv, art_method: u64) -> ArtMethodSpec {
         return spec;
     }
 
-    output_message("[art spec] Frida-style probe 失败，退回 entry_point 探测...");
+    output_verbose("[art spec] Frida-style probe 失败，退回 entry_point 探测...");
 
     // Strategy 2: Fallback — probe entry_point offset using code pointer heuristic
     let ep_offset = probe_entry_point_offset_legacy(env, art_method);
     let api_level = get_android_api_level();
-    let size = if api_level <= 21 {
-        ep_offset + 32
-    } else {
-        ep_offset + 8
-    };
+    let size = if api_level <= 21 { ep_offset + 32 } else { ep_offset + 8 };
     ArtMethodSpec {
         access_flags_offset: 4,     // AOSP default
         data_offset: ep_offset - 8, // data_ precedes entry_point_
@@ -399,7 +438,7 @@ unsafe fn probe_art_method_spec_frida(env: JniEnv) -> Option<ArtMethodSpec> {
     // Step 1: 获取 Process.getElapsedCpuTime 的 ArtMethod*
     let probe_method = get_known_native_art_method(env)?;
 
-    output_message(&format!(
+    output_verbose(&format!(
         "[art spec] 探测方法: Process.getElapsedCpuTime ArtMethod*={:#x}",
         probe_method
     ));
@@ -407,11 +446,11 @@ unsafe fn probe_art_method_spec_frida(env: JniEnv) -> Option<ArtMethodSpec> {
     // Step 2: 获取 libandroid_runtime.so 地址范围（native 实现所在）
     let (rt_start, rt_end) = probe_module_range("libandroid_runtime.so");
     if rt_start == 0 {
-        output_message("[art spec] libandroid_runtime.so 范围获取失败");
+        output_verbose("[art spec] libandroid_runtime.so 范围获取失败");
         return None;
     }
 
-    output_message(&format!(
+    output_verbose(&format!(
         "[art spec] libandroid_runtime.so range: {:#x}-{:#x}",
         rt_start, rt_end
     ));
@@ -422,8 +461,7 @@ unsafe fn probe_art_method_spec_frida(env: JniEnv) -> Option<ArtMethodSpec> {
     // Step 3: 单循环独立扫描 access_flags 和 jniCode（对标 Frida 的 remaining 计数器模式）
     // 不假设 access_flags 在 jniCode 之前 — 两者独立检测，兼容厂商魔改布局
     const EXPECTED_FLAGS: u32 = 0x0119; // kAccPublic|kAccStatic|kAccFinal|kAccNative
-    const NOISE_MASK: u32 =
-        K_ACC_FAST_INTERP_TO_INTERP | K_ACC_PUBLIC_API | K_ACC_NTERP_INVOKE_FAST_PATH_FLAG;
+    const NOISE_MASK: u32 = K_ACC_FAST_INTERP_TO_INTERP | K_ACC_PUBLIC_API | K_ACC_NTERP_INVOKE_FAST_PATH_FLAG;
     const RELEVANT_MASK: u32 = !NOISE_MASK;
     const MAX_SCAN: usize = 64;
 
@@ -442,7 +480,7 @@ unsafe fn probe_art_method_spec_frida(env: JniEnv) -> Option<ArtMethodSpec> {
             if (val & RELEVANT_MASK) == EXPECTED_FLAGS {
                 access_flags_offset = Some(offset);
                 remaining -= 1;
-                output_message(&format!(
+                output_verbose(&format!(
                     "[art spec] access_flags 发现: offset={}, value={:#x}, masked={:#x}",
                     offset,
                     val,
@@ -459,7 +497,7 @@ unsafe fn probe_art_method_spec_frida(env: JniEnv) -> Option<ArtMethodSpec> {
             if stripped >= rt_start && stripped < rt_end {
                 data_offset = Some(offset);
                 remaining -= 1;
-                output_message(&format!(
+                output_verbose(&format!(
                     "[art spec] data_ (jniCode) 发现: offset={}, value={:#x}",
                     offset, val
                 ));
@@ -470,7 +508,7 @@ unsafe fn probe_art_method_spec_frida(env: JniEnv) -> Option<ArtMethodSpec> {
     let af_offset = match access_flags_offset {
         Some(o) => o,
         None => {
-            output_message("[art spec] access_flags 未找到");
+            output_verbose("[art spec] access_flags 未找到");
             return None;
         }
     };
@@ -478,7 +516,7 @@ unsafe fn probe_art_method_spec_frida(env: JniEnv) -> Option<ArtMethodSpec> {
     let d_offset = match data_offset {
         Some(o) => o,
         None => {
-            output_message("[art spec] data_ (jniCode) 未找到 (expected in libandroid_runtime.so)");
+            output_verbose("[art spec] data_ (jniCode) 未找到 (expected in libandroid_runtime.so)");
             return None;
         }
     };
@@ -489,15 +527,15 @@ unsafe fn probe_art_method_spec_frida(env: JniEnv) -> Option<ArtMethodSpec> {
     // ARM64 上两者都是 8，但 size 计算不同
     let api_level = get_android_api_level();
     let ep_offset = d_offset + 8;
-    // 对标 Frida: API <= 21 ArtMethod 有额外 GC map/vmap 字段 → +32
-    //            API >= 22 entry_point 是最后一个字段 → +pointerSize(8)
-    let size = if api_level <= 21 {
-        ep_offset + 32
-    } else {
-        ep_offset + 8
-    };
+    // size 必须覆盖所有会被读写的字段。
+    // Frida 公式: quickCodeOffset + pointerSize，但 Android 16 (API 36) 的
+    // access_flags 可能在 entry_point 之后 (offset 36 > quickCode+8=32)。
+    // 取所有字段末尾的最大值。
+    let frida_size = if api_level <= 21 { ep_offset + 32 } else { ep_offset + 8 };
+    let access_flags_end = af_offset + 4; // access_flags is u32
+    let size = frida_size.max(access_flags_end);
 
-    output_message(&format!(
+    output_verbose(&format!(
         "[art spec] Frida-style 探测成功: access_flags={}, data_={}, entry_point={}, size={} (API {})",
         af_offset, d_offset, ep_offset, size, api_level
     ));
@@ -521,20 +559,19 @@ unsafe fn get_known_native_art_method(env: JniEnv) -> Option<u64> {
     let c_sig = CString::new("()J").unwrap();
 
     let find_class: FindClassFn = jni_fn!(env, FindClassFn, JNI_FIND_CLASS);
-    let get_static_mid: GetStaticMethodIdFn =
-        jni_fn!(env, GetStaticMethodIdFn, JNI_GET_STATIC_METHOD_ID);
+    let get_static_mid: GetStaticMethodIdFn = jni_fn!(env, GetStaticMethodIdFn, JNI_GET_STATIC_METHOD_ID);
     let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
 
     let cls = find_class(env, c_class.as_ptr());
     if cls.is_null() || jni_check_exc(env) {
-        output_message("[art spec] FindClass(android/os/Process) 失败");
+        output_verbose("[art spec] FindClass(android/os/Process) 失败");
         return None;
     }
 
     let mid = get_static_mid(env, cls, c_method.as_ptr(), c_sig.as_ptr());
     if mid.is_null() || jni_check_exc(env) {
         delete_local_ref(env, cls);
-        output_message("[art spec] GetStaticMethodID(getElapsedCpuTime) 失败");
+        output_verbose("[art spec] GetStaticMethodID(getElapsedCpuTime) 失败");
         return None;
     }
 
@@ -544,7 +581,7 @@ unsafe fn get_known_native_art_method(env: JniEnv) -> Option<u64> {
     delete_local_ref(env, cls);
 
     if art_method != mid as u64 {
-        output_message(&format!(
+        output_verbose(&format!(
             "[art spec] jmethodID 已解码: {:#x} → ArtMethod*={:#x}",
             mid as u64, art_method
         ));
@@ -564,7 +601,7 @@ fn probe_entry_point_offset_legacy(env: JniEnv, target_art_method: u64) -> usize
     let is_24 = is_code_pointer(val_24);
     let is_32 = is_code_pointer(val_32);
 
-    output_message(&format!(
+    output_verbose(&format!(
         "[art spec] legacy probe: val_24={:#x} (code={}), val_32={:#x} (code={})",
         val_24, is_24, val_32, is_32
     ));
@@ -586,10 +623,7 @@ fn probe_entry_point_offset_legacy(env: JniEnv, target_art_method: u64) -> usize
         probe_with_known_method_legacy(env).unwrap_or(24)
     };
 
-    output_message(&format!(
-        "[art spec] legacy result: entry_point offset={}",
-        offset
-    ));
+    output_verbose(&format!("[art spec] legacy result: entry_point offset={}", offset));
     offset
 }
 
@@ -602,8 +636,7 @@ fn probe_with_known_method_legacy(env: JniEnv) -> Option<usize> {
 
         let find_class: FindClassFn = jni_fn!(env, FindClassFn, JNI_FIND_CLASS);
         let get_mid: GetMethodIdFn = jni_fn!(env, GetMethodIdFn, JNI_GET_METHOD_ID);
-        let delete_local_ref: DeleteLocalRefFn =
-            jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
+        let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
 
         let cls = find_class(env, c_class.as_ptr());
         if cls.is_null() || jni_check_exc(env) {
@@ -641,6 +674,7 @@ pub(super) const JNI_GET_SUPERCLASS: usize = 10;
 pub(super) const JNI_TO_REFLECTED_METHOD: usize = 9;
 #[allow(dead_code)]
 pub(super) const JNI_TO_REFLECTED_FIELD: usize = 12;
+pub(super) const JNI_EXCEPTION_OCCURRED: usize = 15;
 pub(super) const JNI_EXCEPTION_CLEAR: usize = 17;
 pub(super) const JNI_PUSH_LOCAL_FRAME: usize = 19;
 pub(super) const JNI_POP_LOCAL_FRAME: usize = 20;
@@ -661,6 +695,14 @@ pub(super) const JNI_GET_STRING_UTF_CHARS: usize = 169;
 pub(super) const JNI_RELEASE_STRING_UTF_CHARS: usize = 170;
 pub(super) const JNI_GET_ARRAY_LENGTH: usize = 171;
 pub(super) const JNI_GET_OBJECT_ARRAY_ELEMENT: usize = 173;
+pub(super) const JNI_GET_BOOLEAN_ARRAY_REGION: usize = 199;
+pub(super) const JNI_GET_BYTE_ARRAY_REGION: usize = 200;
+pub(super) const JNI_GET_CHAR_ARRAY_REGION: usize = 201;
+pub(super) const JNI_GET_SHORT_ARRAY_REGION: usize = 202;
+pub(super) const JNI_GET_INT_ARRAY_REGION: usize = 203;
+pub(super) const JNI_GET_LONG_ARRAY_REGION: usize = 204;
+pub(super) const JNI_GET_FLOAT_ARRAY_REGION: usize = 205;
+pub(super) const JNI_GET_DOUBLE_ARRAY_REGION: usize = 206;
 pub(super) const JNI_EXCEPTION_CHECK: usize = 228;
 pub(super) const JNI_NEW_OBJECT_A: usize = 30;
 
@@ -703,6 +745,8 @@ pub(super) const JNI_GET_OBJECT_CLASS: usize = 31;
 pub(super) const JNI_IS_INSTANCE_OF: usize = 32;
 pub(super) const JNI_NEW_GLOBAL_REF: usize = 21;
 pub(super) const JNI_NEW_LOCAL_REF: usize = 25;
+pub(super) const JNI_MONITOR_ENTER: usize = 217;
+pub(super) const JNI_MONITOR_EXIT: usize = 218;
 pub(super) const JNI_GET_FIELD_ID: usize = 94;
 pub(super) const JNI_GET_OBJECT_FIELD: usize = 95;
 pub(super) const JNI_GET_BOOLEAN_FIELD: usize = 96;
@@ -725,6 +769,28 @@ pub(super) const JNI_GET_STATIC_INT_FIELD: usize = 150;
 pub(super) const JNI_GET_STATIC_LONG_FIELD: usize = 151;
 pub(super) const JNI_GET_STATIC_FLOAT_FIELD: usize = 152;
 pub(super) const JNI_GET_STATIC_DOUBLE_FIELD: usize = 153;
+
+// Static field write
+pub(super) const JNI_SET_STATIC_OBJECT_FIELD: usize = 154;
+pub(super) const JNI_SET_STATIC_BOOLEAN_FIELD: usize = 155;
+pub(super) const JNI_SET_STATIC_BYTE_FIELD: usize = 156;
+pub(super) const JNI_SET_STATIC_CHAR_FIELD: usize = 157;
+pub(super) const JNI_SET_STATIC_SHORT_FIELD: usize = 158;
+pub(super) const JNI_SET_STATIC_INT_FIELD: usize = 159;
+pub(super) const JNI_SET_STATIC_LONG_FIELD: usize = 160;
+pub(super) const JNI_SET_STATIC_FLOAT_FIELD: usize = 161;
+pub(super) const JNI_SET_STATIC_DOUBLE_FIELD: usize = 162;
+
+// Instance field write
+pub(super) const JNI_SET_OBJECT_FIELD: usize = 104;
+pub(super) const JNI_SET_BOOLEAN_FIELD: usize = 105;
+pub(super) const JNI_SET_BYTE_FIELD: usize = 106;
+pub(super) const JNI_SET_CHAR_FIELD: usize = 107;
+pub(super) const JNI_SET_SHORT_FIELD: usize = 108;
+pub(super) const JNI_SET_INT_FIELD: usize = 109;
+pub(super) const JNI_SET_LONG_FIELD: usize = 110;
+pub(super) const JNI_SET_FLOAT_FIELD: usize = 111;
+pub(super) const JNI_SET_DOUBLE_FIELD: usize = 112;
 
 // ============================================================================
 // JNI state (lazy-initialized, cached)
@@ -773,20 +839,12 @@ pub(crate) fn ensure_jni_initialized() -> Result<JniEnv, String> {
 
     // Slow path: find JavaVM first
     unsafe {
-        // Find JNI_GetCreatedJavaVMs — 直接走 unrestricted API
-        // hide_soinfo 摘除 agent soinfo 后，libc::dlsym/dlopen 会导致 linker
-        // 内部空指针崩溃（caller soinfo 不存在），必须跳过。
         let sym = crate::jsapi::module::libart_dlsym("JNI_GetCreatedJavaVMs");
         if sym.is_null() {
             return Err("dlsym(JNI_GetCreatedJavaVMs) failed".to_string());
         }
 
-        // JNI_GetCreatedJavaVMs(JavaVM** vmBuf, jsize bufLen, jsize* nVMs) -> jint
-        let get_vms: unsafe extern "C" fn(
-            *mut *mut std::ffi::c_void, // JavaVM**
-            i32,
-            *mut i32,
-        ) -> i32 = std::mem::transmute(sym);
+        let get_vms: unsafe extern "C" fn(*mut *mut std::ffi::c_void, i32, *mut i32) -> i32 = std::mem::transmute(sym);
 
         let mut vm_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
         let mut vm_count: i32 = 0;
@@ -809,17 +867,28 @@ pub(crate) fn ensure_jni_initialized() -> Result<JniEnv, String> {
 /// Attach the current thread to the JavaVM and return its JNIEnv*.
 /// Idempotent — returns existing env if thread is already attached.
 unsafe fn attach_current_thread(vm_ptr: *mut std::ffi::c_void) -> Result<JniEnv, String> {
+    // 先试 GetEnv — 如果当前线程已 attach，直接返回（不触发 Thread::Attach）
     let vm_table = *(vm_ptr as *const *const *const std::ffi::c_void);
+    let get_env_fn: unsafe extern "C" fn(*mut std::ffi::c_void, *mut *mut std::ffi::c_void, i32) -> i32 =
+        std::mem::transmute(*vm_table.add(6)); // GetEnv = index 6
+
+    let mut env_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+    let get_env_ret = get_env_fn(vm_ptr, &mut env_ptr, 0x00010006); // JNI_VERSION_1_6
+    if get_env_ret == 0 && !env_ptr.is_null() {
+        return Ok(env_ptr as JniEnv);
+    }
+
+    // GetEnv 失败 → 需要 AttachCurrentThread
     let attach_fn: unsafe extern "C" fn(
         *mut std::ffi::c_void,
         *mut *mut std::ffi::c_void,
         *mut std::ffi::c_void,
     ) -> i32 = std::mem::transmute(*vm_table.add(4));
 
-    let mut env_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+    env_ptr = std::ptr::null_mut();
     let ret = attach_fn(vm_ptr, &mut env_ptr, std::ptr::null_mut());
     if ret != 0 || env_ptr.is_null() {
-        return Err("AttachCurrentThread failed".to_string());
+        return Err(format!("AttachCurrentThread failed (ret={})", ret));
     }
 
     Ok(env_ptr as JniEnv)
@@ -850,7 +919,7 @@ static IS_API_34_OR_APEX_EQUIV: std::sync::OnceLock<bool> = std::sync::OnceLock:
 pub(super) fn get_art_apex_version() -> u64 {
     *ART_APEX_VERSION.get_or_init(|| {
         let version = parse_art_apex_version();
-        output_message(&format!("[apex] ART APEX version: {}", version));
+        output_verbose(&format!("[apex] ART APEX version: {}", version));
         version
     })
 }
@@ -871,14 +940,14 @@ pub(super) fn is_api_level_34_or_apex_equivalent() -> bool {
             // 检查 API 34 新增符号
             let sym1 = libart_dlsym("_ZN3art7AppInfo29GetPrimaryApkReferenceProfileEv");
             if !sym1.is_null() {
-                output_message("[apex] API 34+ 等效: 发现 AppInfo::GetPrimaryApkReferenceProfile");
+                output_verbose("[apex] API 34+ 等效: 发现 AppInfo::GetPrimaryApkReferenceProfile");
                 return true;
             }
 
             // Thread::RunFlipFunction(Thread*, bool) — API 34 新增 bool 参数重载
             let sym2 = libart_dlsym("_ZN3art6Thread15RunFlipFunctionEPS0_b");
             if !sym2.is_null() {
-                output_message("[apex] API 34+ 等效: 发现 Thread::RunFlipFunction(Thread*, bool)");
+                output_verbose("[apex] API 34+ 等效: 发现 Thread::RunFlipFunction(Thread*, bool)");
                 return true;
             }
 
@@ -886,7 +955,7 @@ pub(super) fn is_api_level_34_or_apex_equivalent() -> bool {
         };
 
         if !result {
-            output_message("[apex] API 34+ 等效检测: 未发现特征符号");
+            output_verbose("[apex] API 34+ 等效检测: 未发现特征符号");
         }
         result
     })
@@ -919,8 +988,7 @@ unsafe impl Send for JniIdDecoderState {}
 unsafe impl Sync for JniIdDecoderState {}
 
 /// C++ 成员函数签名: ArtMethod*/ArtField* DecodeXxxId(JniIdManager* this, jxxxID id)
-type DecodeIdFn =
-    unsafe extern "C" fn(this: *mut std::ffi::c_void, id: *mut std::ffi::c_void) -> u64;
+type DecodeIdFn = unsafe extern "C" fn(this: *mut std::ffi::c_void, id: *mut std::ffi::c_void) -> u64;
 
 /// kPointer = 0 (jmethodID 直接是 ArtMethod*)
 const K_POINTER: i32 = 0;
@@ -937,14 +1005,14 @@ static JNI_ID_DECODER: std::sync::OnceLock<Option<JniIdDecoderState>> = std::syn
 /// 5. 如果 decode 函数不可用但 indirection != kPointer → fallback 强制写 kPointer
 pub(super) fn init_jni_id_decoder() {
     JNI_ID_DECODER.get_or_init(|| {
-        use super::art_method::{get_jni_ids_indirection_offset, get_art_runtime_spec};
+        use super::art_method::{get_art_runtime_spec, get_jni_ids_indirection_offset};
         use super::PAC_STRIP_MASK;
 
         // Step 1: 探测 indirection offset
         let indirection_offset = match get_jni_ids_indirection_offset() {
             Some(o) => o,
             None => {
-                output_message("[jniIds] indirection offset 不可用，ID 解码走 fallback 路径");
+                output_verbose("[jniIds] indirection offset 不可用，ID 解码走 fallback 路径");
                 return None;
             }
         };
@@ -953,7 +1021,7 @@ pub(super) fn init_jni_id_decoder() {
         let runtime = match unsafe { get_runtime_addr() } {
             Some(r) => r,
             None => {
-                output_message("[jniIds] 无法获取 Runtime 地址");
+                output_verbose("[jniIds] 无法获取 Runtime 地址");
                 return None;
             }
         };
@@ -962,9 +1030,7 @@ pub(super) fn init_jni_id_decoder() {
 
         // Step 3: dlsym DecodeMethodId / DecodeFieldId (对标 Frida android.js:316-317)
         let decode_method_fn = unsafe {
-            let sym = crate::jsapi::module::libart_dlsym(
-                "_ZN3art3jni12JniIdManager14DecodeMethodIdEP10_jmethodID"
-            );
+            let sym = crate::jsapi::module::libart_dlsym("_ZN3art3jni12JniIdManager14DecodeMethodIdEP10_jmethodID");
             if !sym.is_null() {
                 Some(std::mem::transmute::<*mut std::ffi::c_void, DecodeIdFn>(sym))
             } else {
@@ -973,9 +1039,7 @@ pub(super) fn init_jni_id_decoder() {
         };
 
         let decode_field_fn = unsafe {
-            let sym = crate::jsapi::module::libart_dlsym(
-                "_ZN3art3jni12JniIdManager13DecodeFieldIdEP9_jfieldID"
-            );
+            let sym = crate::jsapi::module::libart_dlsym("_ZN3art3jni12JniIdManager13DecodeFieldIdEP9_jfieldID");
             if !sym.is_null() {
                 Some(std::mem::transmute::<*mut std::ffi::c_void, DecodeIdFn>(sym))
             } else {
@@ -988,13 +1052,9 @@ pub(super) fn init_jni_id_decoder() {
             match get_art_runtime_spec() {
                 Some(spec) => match spec.jni_id_manager_offset {
                     Some(off) => {
-                        let mgr = unsafe {
-                            super::safe_mem::safe_read_u64(runtime + off as u64) & PAC_STRIP_MASK
-                        };
+                        let mgr = unsafe { super::safe_mem::safe_read_u64(runtime + off as u64) & PAC_STRIP_MASK };
                         if mgr != 0 {
-                            output_message(&format!(
-                                "[jniIds] JniIdManager*={:#x} (Runtime+{:#x})", mgr, off
-                            ));
+                            output_verbose(&format!("[jniIds] JniIdManager*={:#x} (Runtime+{:#x})", mgr, off));
                         }
                         mgr
                     }
@@ -1012,21 +1072,23 @@ pub(super) fn init_jni_id_decoder() {
         // 如果 decode 函数不可用 → fallback 强制写 kPointer
         let current_mode = unsafe { std::ptr::read_volatile(indirection_field_addr) };
         let forced_pointer_mode = if has_decode {
-            output_message(&format!(
+            output_verbose(&format!(
                 "[jniIds] Frida-style 解码器就绪: DecodeMethodId={}, DecodeFieldId={}, indirection={}",
-                decode_method_fn.is_some(), decode_field_fn.is_some(), current_mode
+                decode_method_fn.is_some(),
+                decode_field_fn.is_some(),
+                current_mode
             ));
             false // 不需要强制写
         } else if current_mode != K_POINTER {
             // 无 decode 函数但 indirection != kPointer → 必须强制写
             unsafe { std::ptr::write_volatile(indirection_field_addr as *mut i32, K_POINTER) };
-            output_message(&format!(
+            output_verbose(&format!(
                 "[jniIds] decode 函数不可用，fallback 强制 indirection {} → 0 (kPointer), Runtime+{:#x}",
                 current_mode, indirection_offset
             ));
             true
         } else {
-            output_message("[jniIds] 已为 kPointer 模式，jmethodID 即 ArtMethod* 直接可用");
+            output_verbose("[jniIds] 已为 kPointer 模式，jmethodID 即 ArtMethod* 直接可用");
             false
         };
 
@@ -1060,10 +1122,7 @@ pub(super) fn is_jni_pointer_mode() -> bool {
 ///
 /// 对标 Frida unwrapGenericId: 读取 indirection 值，如果不是 kPointer
 /// 则调用对应的 DecodeXxxId(jniIdManager, id)。
-unsafe fn decode_id_via_manager(
-    id: u64,
-    get_fn: impl Fn(&JniIdDecoderState) -> Option<DecodeIdFn>,
-) -> Option<u64> {
+unsafe fn decode_id_via_manager(id: u64, get_fn: impl Fn(&JniIdDecoderState) -> Option<DecodeIdFn>) -> Option<u64> {
     let state = JNI_ID_DECODER.get()?.as_ref()?;
 
     if state.forced_pointer_mode {
@@ -1115,7 +1174,7 @@ fn parse_art_apex_version() -> u64 {
     let content = match std::fs::read_to_string("/proc/self/mountinfo") {
         Ok(c) => c,
         Err(_) => {
-            output_message("[apex] /proc/self/mountinfo 读取失败，使用 fallback");
+            output_verbose("[apex] /proc/self/mountinfo 读取失败，使用 fallback");
             let api = get_android_api_level() as u64;
             return api * 10_000_000;
         }
@@ -1141,10 +1200,7 @@ fn parse_art_apex_version() -> u64 {
             // 格式: /apex/com.android.art@341715org — '@' 后面是版本号
             if let Some(version_str) = mount_root.split('@').nth(1) {
                 // 提取纯数字前缀作为版本号
-                let version_digits: String = version_str
-                    .chars()
-                    .take_while(|c| c.is_ascii_digit())
-                    .collect();
+                let version_digits: String = version_str.chars().take_while(|c| c.is_ascii_digit()).collect();
                 if let Ok(version) = version_digits.parse::<u64>() {
                     source_versions.insert(mount_source.to_string(), version);
                 }

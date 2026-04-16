@@ -26,8 +26,7 @@ type VmStackAllocFn = unsafe extern "C" fn(u64, u32) -> c_int;
 type VmSimulateCallFn = unsafe extern "C" fn(u64, u64, *const u64, u32) -> c_int;
 type VmRunFn = unsafe extern "C" fn(u64, u64, u64) -> c_int;
 type VmCallFn = unsafe extern "C" fn(u64, u64, *const u64, u32, *mut u64) -> c_int;
-type VmSwitchStackAndCallFn =
-    unsafe extern "C" fn(u64, u64, u32, *const u64, u32, *mut u64) -> c_int;
+type VmSwitchStackAndCallFn = unsafe extern "C" fn(u64, u64, u32, *const u64, u32, *mut u64) -> c_int;
 type VmGetGprFn = unsafe extern "C" fn(u64, u32, *mut u64) -> c_int;
 type VmSetGprFn = unsafe extern "C" fn(u64, u32, u64) -> c_int;
 type VmGetFprFn = unsafe extern "C" fn(u64, u32, *mut u64, *mut u64) -> c_int;
@@ -35,6 +34,7 @@ type VmSetFprFn = unsafe extern "C" fn(u64, u32, u64, u64) -> c_int;
 type VmGetErrnoFn = unsafe extern "C" fn(u64, *mut u32) -> c_int;
 type VmSetErrnoFn = unsafe extern "C" fn(u64, u32) -> c_int;
 type VmTraceRegisterFn = unsafe extern "C" fn(u64, u64, *const c_char) -> c_int;
+type TraceBundleMetadataFn = unsafe extern "C" fn(*const c_char, u64) -> c_int;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -82,6 +82,7 @@ struct HelperApi {
     vm_set_fpr: VmSetFprFn,
     vm_get_errno: VmGetErrnoFn,
     vm_set_errno: VmSetErrnoFn,
+    trace_set_bundle_metadata: TraceBundleMetadataFn,
     vm_register_trace_callbacks: VmTraceRegisterFn,
     vm_unregister_trace_callbacks: VmUnaryFn,
 }
@@ -134,11 +135,7 @@ fn verify_qbdi_helper_hide_result(handle: *mut c_void) {
     if result.status == 1 {
         output_message(&format!(
             "[qbdi] qbdi-helper hide_soinfo ok: target=\"{}\" next_offset=0x{:x} scanned={} syms={} target=0x{:x}",
-            target_path,
-            result.next_offset,
-            result.entries_scanned,
-            result.sym_matched,
-            result.target_ptr
+            target_path, result.next_offset, result.entries_scanned, result.sym_matched, result.target_ptr
         ));
         if !head_path.is_empty() {
             output_message(&format!(
@@ -187,7 +184,9 @@ unsafe fn build_helper_api(handle: *mut c_void) -> Result<HelperApi, String> {
         vm_destroy: std::mem::transmute(required("qbdi_vm_destroy")?),
         vm_add_instrumented_range: std::mem::transmute(required("qbdi_vm_add_instrumented_range")?),
         vm_add_instrumented_module: std::mem::transmute(required("qbdi_vm_add_instrumented_module")?),
-        vm_add_instrumented_module_from_addr: std::mem::transmute(required("qbdi_vm_add_instrumented_module_from_addr")?),
+        vm_add_instrumented_module_from_addr: std::mem::transmute(required(
+            "qbdi_vm_add_instrumented_module_from_addr",
+        )?),
         vm_instrument_all_executable_maps: std::mem::transmute(required("qbdi_vm_instrument_all_executable_maps")?),
         vm_remove_instrumented_range: std::mem::transmute(required("qbdi_vm_remove_instrumented_range")?),
         vm_remove_all_instrumented_ranges: std::mem::transmute(required("qbdi_vm_remove_all_instrumented_ranges")?),
@@ -205,6 +204,7 @@ unsafe fn build_helper_api(handle: *mut c_void) -> Result<HelperApi, String> {
         vm_set_fpr: std::mem::transmute(required("qbdi_vm_set_fpr")?),
         vm_get_errno: std::mem::transmute(required("qbdi_vm_get_errno")?),
         vm_set_errno: std::mem::transmute(required("qbdi_vm_set_errno")?),
+        trace_set_bundle_metadata: std::mem::transmute(required("qbdi_trace_set_bundle_metadata")?),
         vm_register_trace_callbacks: std::mem::transmute(required("qbdi_vm_register_trace_callbacks")?),
         vm_unregister_trace_callbacks: std::mem::transmute(required("qbdi_vm_unregister_trace_callbacks")?),
     })
@@ -215,11 +215,9 @@ fn load_qbdi_helper() -> Result<&'static HelperApi, String> {
         return Ok(api);
     }
 
-    let helper_blob =
-        qbdi_helper_blob().ok_or_else(|| "qbdi helper blob not configured".to_string())?;
+    let helper_blob = qbdi_helper_blob().ok_or_else(|| "qbdi helper blob not configured".to_string())?;
     let memfd_name = CString::new("wwb_so").unwrap();
-    let fd =
-        unsafe { libc::syscall(libc::SYS_memfd_create as libc::c_long, memfd_name.as_ptr(), 0) as c_int };
+    let fd = unsafe { libc::syscall(libc::SYS_memfd_create as libc::c_long, memfd_name.as_ptr(), 0) as c_int };
     if fd < 0 {
         return Err(format!(
             "memfd_create(qbdi_helper) failed: {}",
@@ -300,7 +298,9 @@ unsafe fn extract_u32_arg(
     value.ok_or_else(|| {
         ffi::JS_ThrowTypeError(
             ctx,
-            CString::new(format!("{}() argument {} must be u32", func, index)).unwrap().as_ptr(),
+            CString::new(format!("{}() argument {} must be u32", func, index))
+                .unwrap()
+                .as_ptr(),
         )
     })
 }
@@ -314,7 +314,9 @@ unsafe fn extract_string_arg_owned(
     JSValue(*argv.add(index)).to_string(ctx).ok_or_else(|| {
         ffi::JS_ThrowTypeError(
             ctx,
-            CString::new(format!("{}() argument {} must be string", func, index)).unwrap().as_ptr(),
+            CString::new(format!("{}() argument {} must be string", func, index))
+                .unwrap()
+                .as_ptr(),
         )
     })
 }
@@ -572,7 +574,12 @@ js_bool_method!(js_qbdi_simulate_call, 2, |ctx, argc, argv| {
         Ok(v) => v,
         Err(e) => return e,
     };
-    bool_from_rc((api.vm_simulate_call)(handle, return_addr, args.as_ptr(), args.len() as u32))
+    bool_from_rc((api.vm_simulate_call)(
+        handle,
+        return_addr,
+        args.as_ptr(),
+        args.len() as u32,
+    ))
 });
 
 js_bool_method!(js_qbdi_run, 3, |ctx, argc, argv| {
@@ -605,7 +612,9 @@ unsafe fn js_call_like(
     if argc < 2 {
         return ffi::JS_ThrowTypeError(
             ctx,
-            CString::new(format!("{}() requires vm and target", func_name)).unwrap().as_ptr(),
+            CString::new(format!("{}() requires vm and target", func_name))
+                .unwrap()
+                .as_ptr(),
         );
     }
     let api = match load_qbdi_helper() {
@@ -827,6 +836,23 @@ js_bool_method!(js_qbdi_set_errno, 2, |ctx, argc, argv| {
     bool_from_rc((api.vm_set_errno)(handle, value))
 });
 
+js_bool_method!(js_qbdi_set_trace_bundle_metadata, 2, |ctx, argc, argv| {
+    let api = match load_qbdi_helper() {
+        Ok(api) => api,
+        Err(err) => return throw_internal_error(ctx, err),
+    };
+    let module_path = match extract_string_arg_owned(ctx, argv, 0, "qbdi.setTraceBundleMetadata") {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let module_base = match extract_u64_arg(ctx, argv, 1, "qbdi.setTraceBundleMetadata") {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let c_path = CString::new(module_path).unwrap();
+    bool_from_rc((api.trace_set_bundle_metadata)(c_path.as_ptr(), module_base))
+});
+
 js_bool_method!(js_qbdi_register_trace_callbacks, 2, |ctx, argc, argv| {
     let api = match load_qbdi_helper() {
         Ok(api) => api,
@@ -898,12 +924,48 @@ pub fn register_qbdi_api(ctx: *mut ffi::JSContext, qbdi_obj: ffi::JSValue) {
         add_cfunction_to_object(ctx, qbdi_obj, "newVM", js_qbdi_new_vm, 0);
         add_cfunction_to_object(ctx, qbdi_obj, "destroyVM", js_qbdi_destroy_vm, 1);
         add_cfunction_to_object(ctx, qbdi_obj, "addInstrumentedRange", js_qbdi_add_instrumented_range, 3);
-        add_cfunction_to_object(ctx, qbdi_obj, "addInstrumentedModule", js_qbdi_add_instrumented_module, 2);
-        add_cfunction_to_object(ctx, qbdi_obj, "addInstrumentedModuleFromAddr", js_qbdi_add_instrumented_module_from_addr, 2);
-        add_cfunction_to_object(ctx, qbdi_obj, "instrumentAllExecutableMaps", js_qbdi_instrument_all_executable_maps, 1);
-        add_cfunction_to_object(ctx, qbdi_obj, "removeInstrumentedRange", js_qbdi_remove_instrumented_range, 3);
-        add_cfunction_to_object(ctx, qbdi_obj, "removeAllInstrumentedRanges", js_qbdi_remove_all_instrumented_ranges, 1);
-        add_cfunction_to_object(ctx, qbdi_obj, "deleteAllInstrumentations", js_qbdi_delete_all_instrumentations, 1);
+        add_cfunction_to_object(
+            ctx,
+            qbdi_obj,
+            "addInstrumentedModule",
+            js_qbdi_add_instrumented_module,
+            2,
+        );
+        add_cfunction_to_object(
+            ctx,
+            qbdi_obj,
+            "addInstrumentedModuleFromAddr",
+            js_qbdi_add_instrumented_module_from_addr,
+            2,
+        );
+        add_cfunction_to_object(
+            ctx,
+            qbdi_obj,
+            "instrumentAllExecutableMaps",
+            js_qbdi_instrument_all_executable_maps,
+            1,
+        );
+        add_cfunction_to_object(
+            ctx,
+            qbdi_obj,
+            "removeInstrumentedRange",
+            js_qbdi_remove_instrumented_range,
+            3,
+        );
+        add_cfunction_to_object(
+            ctx,
+            qbdi_obj,
+            "removeAllInstrumentedRanges",
+            js_qbdi_remove_all_instrumented_ranges,
+            1,
+        );
+        add_cfunction_to_object(
+            ctx,
+            qbdi_obj,
+            "deleteAllInstrumentations",
+            js_qbdi_delete_all_instrumentations,
+            1,
+        );
         add_cfunction_to_object(ctx, qbdi_obj, "recordMemoryAccess", js_qbdi_record_memory_access, 2);
         add_cfunction_to_object(ctx, qbdi_obj, "allocateVirtualStack", js_qbdi_allocate_virtual_stack, 2);
         add_cfunction_to_object(ctx, qbdi_obj, "clearVirtualStacks", js_qbdi_clear_virtual_stacks, 1);
@@ -917,8 +979,27 @@ pub fn register_qbdi_api(ctx: *mut ffi::JSContext, qbdi_obj: ffi::JSValue) {
         add_cfunction_to_object(ctx, qbdi_obj, "setFPR", js_qbdi_set_fpr, 4);
         add_cfunction_to_object(ctx, qbdi_obj, "getErrno", js_qbdi_get_errno, 1);
         add_cfunction_to_object(ctx, qbdi_obj, "setErrno", js_qbdi_set_errno, 2);
-        add_cfunction_to_object(ctx, qbdi_obj, "registerTraceCallbacks", js_qbdi_register_trace_callbacks, 2);
-        add_cfunction_to_object(ctx, qbdi_obj, "unregisterTraceCallbacks", js_qbdi_unregister_trace_callbacks, 1);
+        add_cfunction_to_object(
+            ctx,
+            qbdi_obj,
+            "setTraceBundleMetadata",
+            js_qbdi_set_trace_bundle_metadata,
+            2,
+        );
+        add_cfunction_to_object(
+            ctx,
+            qbdi_obj,
+            "registerTraceCallbacks",
+            js_qbdi_register_trace_callbacks,
+            2,
+        );
+        add_cfunction_to_object(
+            ctx,
+            qbdi_obj,
+            "unregisterTraceCallbacks",
+            js_qbdi_unregister_trace_callbacks,
+            1,
+        );
         add_cfunction_to_object(ctx, qbdi_obj, "lastError", js_qbdi_last_error, 0);
         add_cfunction_to_object(ctx, qbdi_obj, "shutdown", js_qbdi_shutdown, 0);
     }

@@ -801,6 +801,32 @@ void arm64_writer_put_branch_address(Arm64Writer* w, uint64_t target) {
     arm64_writer_put_branch_address_reg(w, target, ARM64_REG_X16);
 }
 
+/* ADRP+ADD+BR: 12 字节 PC-relative 跳转（纯 ALU，wxshadow 安全）。
+ * 要求 target 在 PC ±4GB 范围内。 */
+void arm64_writer_put_adrp_add_br(Arm64Writer* w, Arm64Reg scratch, uint64_t target) {
+    uint64_t pc = w->pc + arm64_writer_offset(w);
+    uint64_t pc_page = pc & ~0xFFFULL;
+    uint64_t target_page = target & ~0xFFFULL;
+    int64_t page_delta = (int64_t)(target_page - pc_page);
+    int32_t immhi = (int32_t)(page_delta >> 14) & 0x7FFFF; /* bits [32:14] */
+    int32_t immlo = (int32_t)(page_delta >> 12) & 0x3;     /* bits [13:12] */
+    uint32_t rd = scratch - ARM64_REG_X0;
+
+    /* ADRP Xd, #page_delta */
+    uint32_t adrp = (1 << 31) | ((uint32_t)immlo << 29) | (0x10 << 24) | ((uint32_t)immhi << 5) | rd;
+    arm64_writer_put_insn(w, adrp);
+
+    /* ADD Xd, Xd, #lo12
+     * encoding: sf=1 | 00 | 10001 | shift=0 | imm12 | Rn | Rd
+     * = 0x91000000 | (imm12 << 10) | (Rn << 5) | Rd */
+    uint32_t lo12 = (uint32_t)(target & 0xFFF);
+    uint32_t add = 0x91000000 | (lo12 << 10) | (rd << 5) | rd;
+    arm64_writer_put_insn(w, add);
+
+    /* BR Xd */
+    arm64_writer_put_br_reg(w, scratch);
+}
+
 void arm64_writer_put_call_address(Arm64Writer* w, uint64_t target) {
     arm64_writer_put_call_address_reg(w, target, ARM64_REG_X16);
 }

@@ -17,28 +17,18 @@ extern "C" {
     // On some platforms `ucontext` contains a u128 which does not have a defined ABI. In this case,
     // we disable the error as we assume the behaviour is correct (all other platforms are unaffected).
     #[allow(improper_ctypes)]
-    fn gum_linux_parse_ucontext(
-        context: *const libc::ucontext_t,
-        cpu_context: *mut gum_sys::GumCpuContext,
-    );
+    fn gum_linux_parse_ucontext(context: *const libc::ucontext_t, cpu_context: *mut gum_sys::GumCpuContext);
 }
 
 pub struct Backtracer;
 
 impl Backtracer {
     /// Generate a backtrace
-    fn generate(
-        backtracer: *mut gum_sys::GumBacktracer,
-        context: *const gum_sys::GumCpuContext,
-    ) -> Vec<usize> {
+    fn generate(backtracer: *mut gum_sys::GumBacktracer, context: *const gum_sys::GumCpuContext) -> Vec<usize> {
         let mut return_address_array = MaybeUninit::<gum_sys::_GumReturnAddressArray>::uninit();
 
         unsafe {
-            gum_sys::gum_backtracer_generate(
-                backtracer,
-                context,
-                return_address_array.as_mut_ptr(),
-            );
+            gum_sys::gum_backtracer_generate(backtracer, context, return_address_array.as_mut_ptr());
             let return_address_array = return_address_array.assume_init();
             let mut result = vec![];
             for i in 0..return_address_array.len {
@@ -50,18 +40,12 @@ impl Backtracer {
 
     /// Generate an accurate backtrace as a list of return addresses from the current context
     pub fn accurate() -> Vec<usize> {
-        Self::generate(
-            unsafe { gum_sys::gum_backtracer_make_accurate() },
-            core::ptr::null(),
-        )
+        Self::generate(unsafe { gum_sys::gum_backtracer_make_accurate() }, core::ptr::null())
     }
 
     /// Generate a fuzzy backtrace as a list of return addresses from the current context
     pub fn fuzzy() -> Vec<usize> {
-        Self::generate(
-            unsafe { gum_sys::gum_backtracer_make_fuzzy() },
-            core::ptr::null(),
-        )
+        Self::generate(unsafe { gum_sys::gum_backtracer_make_fuzzy() }, core::ptr::null())
     }
 
     /// Generate an accurate backtrace as a list of return addresses for the supplied cpu

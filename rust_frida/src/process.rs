@@ -11,15 +11,15 @@ use std::mem::size_of_val;
 use std::path::Path;
 use std::process;
 
-use crate::log_success;
-use crate::log_warn;
-use crate::types::UserRegs;
+use crate::types::{UserFpRegs, UserRegs};
+use crate::{log_info, log_success, log_warn};
 
 /// 获取指定库的基址
 ///
 /// # 参数
 /// * `pid`      - 进程ID，`None` 表示查询当前进程
 /// * `lib_name` - 要查找的库名称（如 "libc.so"、"libdl.so"）
+#[allow(dead_code)]
 pub(crate) fn get_lib_base(pid: Option<i32>, lib_name: &str) -> Result<usize, String> {
     let maps_path = match pid {
         Some(pid) => format!("/proc/{}/maps", pid),
@@ -32,26 +32,20 @@ pub(crate) fn get_lib_base(pid: Option<i32>, lib_name: &str) -> Result<usize, St
 
     let mut file = File::open(&maps_path).map_err(|e| format!("无法打开maps文件: {}", e))?;
     let mut raw = Vec::new();
-    std::io::Read::read_to_end(&mut file, &mut raw)
-        .map_err(|e| format!("读取maps文件失败: {}", e))?;
+    std::io::Read::read_to_end(&mut file, &mut raw).map_err(|e| format!("读取maps文件失败: {}", e))?;
 
     for line in String::from_utf8_lossy(&raw).lines() {
         if line.contains(lib_name) {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if let Some(addr_range) = parts.get(0) {
                 if let Some(start_addr) = addr_range.split('-').next() {
-                    return usize::from_str_radix(start_addr, 16)
-                        .map_err(|e| format!("解析地址失败: {}", e));
+                    return usize::from_str_radix(start_addr, 16).map_err(|e| format!("解析地址失败: {}", e));
                 }
             }
         }
     }
 
-    Err(format!(
-        "未找到进程 {} 的{}加载地址",
-        pid.unwrap_or(-1),
-        lib_name
-    ))
+    Err(format!("未找到进程 {} 的{}加载地址", pid.unwrap_or(-1), lib_name))
 }
 
 fn find_map_line_for_addr(pid: i32, addr: u64) -> Option<String> {
@@ -73,8 +67,36 @@ fn find_map_line_for_addr(pid: i32, addr: u64) -> Option<String> {
     None
 }
 
+/// 解冻 cgroup v2 freezer（Android 12+ 会冻结后台进程）
+/// 冻结状态下 ptrace attach 的 SIGSTOP 无法送达，waitpid 会永远阻塞。
+fn thaw_cgroup_freezer(pid: i32) {
+    // cgroup v2 freezer 路径格式：/sys/fs/cgroup/<slice>/uid_<uid>/pid_<pid>/cgroup.freeze
+    let cgroup_path = format!("/proc/{}/cgroup", pid);
+    let content = match std::fs::read_to_string(&cgroup_path) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    // 解析 cgroup 路径，例如 "0::/system/uid_1000/pid_13323"
+    for line in content.lines() {
+        let parts: Vec<&str> = line.splitn(3, ':').collect();
+        if parts.len() == 3 {
+            let cgroup_rel = parts[2].trim_start_matches('/');
+            let freeze_path = format!("/sys/fs/cgroup/{}/cgroup.freeze", cgroup_rel);
+            if let Ok(val) = std::fs::read_to_string(&freeze_path) {
+                if val.trim() == "1" {
+                    log_info!("解冻 cgroup freezer: {}", freeze_path);
+                    let _ = std::fs::write(&freeze_path, "0");
+                }
+            }
+        }
+    }
+}
+
 pub(crate) fn attach_to_process(pid: i32) -> Result<(), String> {
     let target_pid = Pid::from_raw(pid);
+
+    // 解冻 cgroup freezer（Android 12+ 后台进程可能被冻结）
+    thaw_cgroup_freezer(pid);
 
     // 尝试附加到目标进程
     match ptrace::attach(target_pid) {
@@ -97,6 +119,32 @@ pub(crate) fn attach_to_process(pid: i32) -> Result<(), String> {
             Err(err_msg.to_string())
         }
     }
+}
+
+/// 获取进程寄存器（pub 接口供 code-swap 使用）
+/// 轮询 /proc/pid/status 等待进程进入 stopped 状态
+pub(crate) fn wait_process_stopped(pid: u32, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Ok(data) = std::fs::read(format!("/proc/{}/status", pid)) {
+            let status = String::from_utf8_lossy(&data);
+            for line in status.lines() {
+                if line.starts_with("State:") && line.contains("stopped") {
+                    return true;
+                }
+            }
+        } else {
+            return false; // 进程不存在
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+pub(crate) fn get_registers_pub(pid: i32) -> Result<UserRegs, String> {
+    get_registers(pid)
 }
 
 /// 获取进程寄存器
@@ -128,17 +176,46 @@ fn set_registers(pid: i32, regs: &UserRegs) -> Result<(), String> {
         iov_base: regs as *const _ as *mut c_void,
         iov_len: size_of_val(regs),
     };
+    let result = unsafe { libc::ptrace(PTRACE_SETREGSET, pid as pid_t, 1, &mut iov as *mut _ as *mut c_void) };
+    if result == -1 {
+        let errno = unsafe { *libc::__errno() };
+        return Err(format!("设置寄存器失败，错误码: {}", errno));
+    }
+    Ok(())
+}
+
+/// 获取 FP/SIMD 寄存器 (NT_FPREGSET = 2)
+fn get_fp_registers(pid: i32) -> Result<UserFpRegs, String> {
+    let mut regs = UserFpRegs::default();
+    let mut iov = iovec {
+        iov_base: &mut regs as *mut _ as *mut c_void,
+        iov_len: size_of_val(&regs),
+    };
     let result = unsafe {
         libc::ptrace(
-            PTRACE_SETREGSET,
+            PTRACE_GETREGSET,
             pid as pid_t,
-            1,
+            2, // NT_FPREGSET
             &mut iov as *mut _ as *mut c_void,
         )
     };
     if result == -1 {
         let errno = unsafe { *libc::__errno() };
-        return Err(format!("设置寄存器失败，错误码: {}", errno));
+        return Err(format!("获取 FP 寄存器失败，错误码: {}", errno));
+    }
+    Ok(regs)
+}
+
+/// 设置 FP/SIMD 寄存器 (NT_FPREGSET = 2)
+fn set_fp_registers(pid: i32, regs: &UserFpRegs) -> Result<(), String> {
+    let mut iov = iovec {
+        iov_base: regs as *const _ as *mut c_void,
+        iov_len: size_of_val(regs),
+    };
+    let result = unsafe { libc::ptrace(PTRACE_SETREGSET, pid as pid_t, 2, &mut iov as *mut _ as *mut c_void) };
+    if result == -1 {
+        let errno = unsafe { *libc::__errno() };
+        return Err(format!("设置 FP 寄存器失败，错误码: {}", errno));
     }
     Ok(())
 }
@@ -159,8 +236,9 @@ pub(crate) fn call_target_function(
     args: &[usize],
     debug: Option<bool>,
 ) -> Result<usize, String> {
-    // 获取当前寄存器状态
+    // 获取当前寄存器状态（GP + FP/SIMD）
     let orig_regs = get_registers(pid)?;
+    let orig_fp_regs = get_fp_registers(pid).ok(); // FP 保存失败不阻塞
 
     // 设置新的寄存器状态
     let mut new_regs = orig_regs;
@@ -183,6 +261,21 @@ pub(crate) fn call_target_function(
     // 写入新寄存器值
     set_registers(pid, &new_regs)?;
 
+    // 验证寄存器是否正确设置
+    {
+        let verify = get_registers(pid)?;
+        if verify.pc != new_regs.pc {
+            log_warn!("PC 设置验证失败: 期望 0x{:x}, 实际 0x{:x}", new_regs.pc, verify.pc);
+        }
+        if verify.regs[30] != new_regs.regs[30] {
+            log_warn!(
+                "LR 设置验证失败: 期望 0x{:x}, 实际 0x{:x}",
+                new_regs.regs[30],
+                verify.regs[30]
+            );
+        }
+    }
+
     // 继续执行
     if debug.unwrap_or(false) {
         let _ = ptrace::cont(Pid::from_raw(pid), Some(Signal::SIGSTOP));
@@ -195,7 +288,7 @@ pub(crate) fn call_target_function(
     // 子进程 raise(SIGSTOP) + ptrace attach 的 SIGSTOP 会产生 pending 信号，
     // 导致 PTRACE_CONT 后进程立即被 SIGSTOP 再次停止。
     // 遇到 SIGSTOP 时吞掉信号并重新 CONT，最多重试 3 次。
-    let max_sigstop_retries = 3;
+    let max_sigstop_retries = 50; // 多线程进程可能产生大量信号
     for attempt in 0..=max_sigstop_retries {
         let result = unsafe { libc::ptrace(PTRACE_CONT as c_int, pid as pid_t, 0, 0) };
 
@@ -205,32 +298,64 @@ pub(crate) fn call_target_function(
             }));
         }
 
-        // 等待进程停止
+        // 等待进程停止（可能收到其他线程的信号，需要过滤）
         match waitpid(target_pid, None).map_err(|e| format!("等待进程失败: {}", e))? {
+            WaitStatus::Stopped(stopped_pid, Signal::SIGSEGV) if stopped_pid.as_raw() != pid => {
+                // 其他线程的 SIGSEGV，转发信号并继续等待
+                log_warn!("其他线程 {} 收到 SIGSEGV，转发并继续", stopped_pid);
+                let _ = unsafe { libc::ptrace(PTRACE_CONT as c_int, stopped_pid.as_raw() as pid_t, 0, libc::SIGSEGV) };
+                continue;
+            }
+            WaitStatus::Stopped(stopped_pid, sig) if stopped_pid.as_raw() != pid && sig != Signal::SIGSTOP => {
+                // 其他线程的其他信号，转发并继续
+                log_warn!("其他线程 {} 收到 {:?}，转发并继续", stopped_pid, sig);
+                let _ = unsafe { libc::ptrace(PTRACE_CONT as c_int, stopped_pid.as_raw() as pid_t, 0, sig as i32) };
+                continue;
+            }
             WaitStatus::Stopped(_, Signal::SIGSEGV) => {
-                // 获取寄存器，检查 PC 是否为预期值
+                // 目标线程的 SIGSEGV — 检查 PC 是否为预期值
                 let regs = get_registers(pid)?;
 
                 if regs.pc == 0x340 {
                     // 函数执行完成，获取返回值（ARM64 使用 X0 寄存器返回值）
                     let return_value = regs.regs[0] as usize;
 
-                    // 恢复原始寄存器状态
+                    // 恢复原始寄存器状态（GP + FP/SIMD）
                     set_registers(pid, &orig_regs)?;
+                    if let Some(ref fp) = orig_fp_regs {
+                        let _ = set_fp_registers(pid, fp);
+                    }
+
+                    // 验证恢复后的寄存器
+                    let verify = get_registers(pid)?;
+                    if verify.pc != orig_regs.pc || verify.sp != orig_regs.sp || verify.regs[29] != orig_regs.regs[29] {
+                        log_warn!(
+                            "寄存器恢复验证: PC={:#x}→{:#x} SP={:#x}→{:#x} FP={:#x}→{:#x} LR={:#x}→{:#x}",
+                            orig_regs.pc,
+                            verify.pc,
+                            orig_regs.sp,
+                            verify.sp,
+                            orig_regs.regs[29],
+                            verify.regs[29],
+                            orig_regs.regs[30],
+                            verify.regs[30]
+                        );
+                    }
 
                     return Ok(return_value);
                 } else {
-                    let pc_map = find_map_line_for_addr(pid, regs.pc)
-                        .unwrap_or_else(|| "<unknown mapping>".to_string());
-                    let lr_map = find_map_line_for_addr(pid, regs.regs[30])
-                        .unwrap_or_else(|| "<unknown mapping>".to_string());
+                    let pc_map =
+                        find_map_line_for_addr(pid, regs.pc).unwrap_or_else(|| "<unknown mapping>".to_string());
+                    let lr_map =
+                        find_map_line_for_addr(pid, regs.regs[30]).unwrap_or_else(|| "<unknown mapping>".to_string());
                     return Err(format!(
                         concat!(
                             "函数执行异常，",
                             "PC=0x{:x} [{}], ",
                             "LR=0x{:x} [{}], ",
                             "SP=0x{:x}, ",
-                            "X0=0x{:x}, X1=0x{:x}, X2=0x{:x}, X3=0x{:x}"
+                            "X0=0x{:x}, X1=0x{:x}, X2=0x{:x}, X3=0x{:x}\n\
+                         X19=0x{:x}, X20=0x{:x}, X21=0x{:x}, X22=0x{:x}, X29=0x{:x}"
                         ),
                         regs.pc,
                         pc_map,
@@ -240,7 +365,12 @@ pub(crate) fn call_target_function(
                         regs.regs[0],
                         regs.regs[1],
                         regs.regs[2],
-                        regs.regs[3]
+                        regs.regs[3],
+                        regs.regs[19],
+                        regs.regs[20],
+                        regs.regs[21],
+                        regs.regs[22],
+                        regs.regs[29]
                     ));
                 }
             }
@@ -252,6 +382,15 @@ pub(crate) fn call_target_function(
                 } else {
                     return Err("多次 SIGSTOP 中断，无法执行目标函数".to_string());
                 }
+            }
+            WaitStatus::Stopped(_, sig) => {
+                let regs = get_registers(pid).ok();
+                let info = if let Some(r) = &regs {
+                    format!("PC=0x{:x} LR=0x{:x} X0=0x{:x}", r.pc, r.regs[30], r.regs[0])
+                } else {
+                    "regs unavailable".into()
+                };
+                return Err(format!("进程异常停止: {:?} {}", sig, info));
             }
             status => return Err(format!("进程异常停止: {:?}", status)),
         }
@@ -300,11 +439,7 @@ fn write_remote_mem(pid: i32, addr: usize, data: *const u8, size: usize) -> Resu
 
         // 合并新字节到 word（低字节 → 低地址，ARM64 小端序）
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                data.add(offset),
-                &mut word as *mut u64 as *mut u8,
-                write_size,
-            );
+            std::ptr::copy_nonoverlapping(data.add(offset), &mut word as *mut u64 as *mut u8, write_size);
         }
 
         // 写入目标进程
@@ -357,7 +492,7 @@ pub(crate) fn write_bytes(pid: i32, addr: usize, data: &[u8]) -> Result<(), Stri
 /// * `pid` - 目标进程ID
 /// * `addr` - 目标地址
 /// * `size` - 读取字节数
-fn read_remote_mem(pid: i32, addr: usize, size: usize) -> Result<Vec<u8>, String> {
+pub(crate) fn read_remote_mem(pid: i32, addr: usize, size: usize) -> Result<Vec<u8>, String> {
     let addr = addr & 0x00FFFFFFFFFFFFFF; // 去掉 MTE 标签位
     let mut result = vec![0u8; size];
     let mut offset = 0;
@@ -401,11 +536,7 @@ pub(crate) fn read_memory<T: Default>(pid: i32, addr: usize) -> Result<T, String
     let bytes = read_remote_mem(pid, addr, std::mem::size_of::<T>())?;
     let mut val = T::default();
     unsafe {
-        std::ptr::copy_nonoverlapping(
-            bytes.as_ptr(),
-            &mut val as *mut T as *mut u8,
-            std::mem::size_of::<T>(),
-        );
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), &mut val as *mut T as *mut u8, std::mem::size_of::<T>());
     }
     Ok(val)
 }
@@ -443,8 +574,7 @@ pub(crate) fn parse_proc_maps(pid: u32) -> Result<Vec<MapEntry>, String> {
     let maps_path = format!("/proc/{}/maps", pid);
     let mut file = File::open(&maps_path).map_err(|e| format!("无法打开 {}: {}", maps_path, e))?;
     let mut raw = Vec::new();
-    std::io::Read::read_to_end(&mut file, &mut raw)
-        .map_err(|e| format!("读取 {} 失败: {}", maps_path, e))?;
+    std::io::Read::read_to_end(&mut file, &mut raw).map_err(|e| format!("读取 {} 失败: {}", maps_path, e))?;
     let mut entries = Vec::new();
 
     for line in String::from_utf8_lossy(&raw).lines() {
@@ -459,10 +589,8 @@ pub(crate) fn parse_proc_maps(pid: u32) -> Result<Vec<MapEntry>, String> {
             continue;
         }
 
-        let start =
-            u64::from_str_radix(addr_parts[0], 16).map_err(|e| format!("解析地址失败: {}", e))?;
-        let end =
-            u64::from_str_radix(addr_parts[1], 16).map_err(|e| format!("解析地址失败: {}", e))?;
+        let start = u64::from_str_radix(addr_parts[0], 16).map_err(|e| format!("解析地址失败: {}", e))?;
+        let end = u64::from_str_radix(addr_parts[1], 16).map_err(|e| format!("解析地址失败: {}", e))?;
 
         let perms = parts[1].to_string();
         let offset = if parts.len() > 2 {
@@ -575,10 +703,7 @@ pub(crate) fn find_pid_by_name(name: &str) -> Result<i32, String> {
                 };
                 println!("  PID {:6}: {}", pid, display);
             }
-            Err(format!(
-                "找到 {} 个匹配进程，请使用 --pid <n> 精确指定",
-                matches.len()
-            ))
+            Err(format!("找到 {} 个匹配进程，请使用 --pid <n> 精确指定", matches.len()))
         }
     }
 }

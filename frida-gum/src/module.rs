@@ -8,10 +8,7 @@
 //! Module helpers.
 //!
 
-#![cfg_attr(
-    any(target_arch = "x86_64", target_arch = "x86"),
-    allow(clippy::unnecessary_cast)
-)]
+#![cfg_attr(any(target_arch = "x86_64", target_arch = "x86"), allow(clippy::unnecessary_cast))]
 
 use crate::MemoryRange;
 #[cfg(feature = "std")]
@@ -22,9 +19,7 @@ use {
     core::{ffi::c_void, fmt},
     cstr_core::CString,
     frida_gum_sys as gum_sys,
-    frida_gum_sys::{
-        gboolean, gpointer, GumExportDetails, GumModule, GumSectionDetails, GumSymbolDetails,
-    },
+    frida_gum_sys::{gboolean, gpointer, GumExportDetails, GumModule, GumSectionDetails, GumSymbolDetails},
 };
 
 #[cfg(not(feature = "std"))]
@@ -102,9 +97,7 @@ impl Module {
     pub fn load(_gum: &Gum, module_name: &str) -> Self {
         let module_name = CString::new(module_name).unwrap();
         Self {
-            inner: unsafe {
-                gum_sys::gum_module_load(module_name.as_ptr().cast(), core::ptr::null_mut())
-            },
+            inner: unsafe { gum_sys::gum_module_load(module_name.as_ptr().cast(), core::ptr::null_mut()) },
         }
     }
 
@@ -138,10 +131,8 @@ impl Module {
     pub fn find_export_by_name(&self, symbol_name: &str) -> Option<NativePointer> {
         let symbol_name = CString::new(symbol_name).unwrap();
 
-        let ptr = unsafe {
-            gum_sys::gum_module_find_export_by_name(self.inner, symbol_name.as_ptr().cast())
-                as *mut c_void
-        };
+        let ptr =
+            unsafe { gum_sys::gum_module_find_export_by_name(self.inner, symbol_name.as_ptr().cast()) as *mut c_void };
 
         if ptr.is_null() {
             None
@@ -155,10 +146,7 @@ impl Module {
     pub fn find_global_export_by_name(symbol_name: &str) -> Option<NativePointer> {
         let symbol_name = CString::new(symbol_name).unwrap();
 
-        let ptr = unsafe {
-            gum_sys::gum_module_find_global_export_by_name(symbol_name.as_ptr().cast())
-                as *mut c_void
-        };
+        let ptr = unsafe { gum_sys::gum_module_find_global_export_by_name(symbol_name.as_ptr().cast()) as *mut c_void };
 
         if ptr.is_null() {
             None
@@ -172,9 +160,8 @@ impl Module {
     pub fn find_symbol_by_name(&self, symbol_name: &str) -> Option<NativePointer> {
         let symbol_name = CString::new(symbol_name).unwrap();
 
-        let ptr = unsafe {
-            gum_sys::gum_module_find_symbol_by_name(self.inner, symbol_name.as_ptr().cast())
-        } as *mut c_void;
+        let ptr =
+            unsafe { gum_sys::gum_module_find_symbol_by_name(self.inner, symbol_name.as_ptr().cast()) } as *mut c_void;
 
         if ptr.is_null() {
             None
@@ -184,22 +171,12 @@ impl Module {
     }
 
     /// Enumerates memory ranges satisfying protection given.
-    pub fn enumerate_ranges(
-        &self,
-        prot: PageProtection,
-        callout: impl FnMut(RangeDetails) -> bool,
-    ) {
+    pub fn enumerate_ranges(&self, prot: PageProtection, callout: impl FnMut(RangeDetails) -> bool) {
         unsafe {
-            let user_data = Box::leak(Box::new(
-                Box::new(callout) as Box<dyn FnMut(RangeDetails) -> bool>
-            )) as *mut _ as *mut c_void;
+            let user_data =
+                Box::leak(Box::new(Box::new(callout) as Box<dyn FnMut(RangeDetails) -> bool>)) as *mut _ as *mut c_void;
 
-            gum_sys::gum_module_enumerate_ranges(
-                self.inner,
-                prot as u32,
-                Some(enumerate_ranges_callout),
-                user_data,
-            );
+            gum_sys::gum_module_enumerate_ranges(self.inner, prot as u32, Some(enumerate_ranges_callout), user_data);
 
             let _ = Box::from_raw(user_data as *mut Box<dyn FnMut(RangeDetails) -> bool>);
         }
@@ -209,14 +186,9 @@ impl Module {
     pub fn enumerate_exports(&self) -> Vec<ExportDetails> {
         let result: Vec<ExportDetails> = vec![];
 
-        unsafe extern "C" fn callback(
-            details: *const GumExportDetails,
-            user_data: gpointer,
-        ) -> gboolean {
+        unsafe extern "C" fn callback(details: *const GumExportDetails, user_data: gpointer) -> gboolean {
             let res = &mut *(user_data as *mut Vec<ExportDetails>);
-            let name: String = NativePointer((*details).name as *mut _)
-                .try_into()
-                .unwrap_or_default();
+            let name: String = NativePointer((*details).name as *mut _).try_into().unwrap_or_default();
 
             let address = (*details).address as usize;
             let typ = num::FromPrimitive::from_u32((*details).type_ as u32).unwrap();
@@ -226,11 +198,7 @@ impl Module {
         }
 
         unsafe {
-            frida_gum_sys::gum_module_enumerate_exports(
-                self.inner,
-                Some(callback),
-                &result as *const _ as *mut c_void,
-            );
+            frida_gum_sys::gum_module_enumerate_exports(self.inner, Some(callback), &result as *const _ as *mut c_void);
         }
         result
     }
@@ -238,34 +206,21 @@ impl Module {
     /// Enumerates symbols in module.
     pub fn enumerate_symbols(&self) -> Vec<SymbolDetails> {
         let result: Vec<SymbolDetails> = vec![];
-        unsafe extern "C" fn callback(
-            details: *const GumSymbolDetails,
-            user_data: gpointer,
-        ) -> gboolean {
+        unsafe extern "C" fn callback(details: *const GumSymbolDetails, user_data: gpointer) -> gboolean {
             let res = &mut *(user_data as *mut Vec<SymbolDetails>);
 
-            let name: String = NativePointer((*details).name as *mut _)
-                .try_into()
-                .unwrap_or_default();
+            let name: String = NativePointer((*details).name as *mut _).try_into().unwrap_or_default();
             let address = (*details).address as usize;
             let size = (*details).size as usize;
 
-            let info = SymbolDetails {
-                name,
-                address,
-                size,
-            };
+            let info = SymbolDetails { name, address, size };
             res.push(info);
 
             1
         }
 
         unsafe {
-            frida_gum_sys::gum_module_enumerate_symbols(
-                self.inner,
-                Some(callback),
-                &result as *const _ as *mut c_void,
-            );
+            frida_gum_sys::gum_module_enumerate_symbols(self.inner, Some(callback), &result as *const _ as *mut c_void);
         }
         result
     }
@@ -274,18 +229,11 @@ impl Module {
     pub fn enumerate_sections(&self) -> Vec<SectionDetails> {
         let result: Vec<SectionDetails> = vec![];
 
-        unsafe extern "C" fn callback(
-            details: *const GumSectionDetails,
-            user_data: gpointer,
-        ) -> gboolean {
+        unsafe extern "C" fn callback(details: *const GumSectionDetails, user_data: gpointer) -> gboolean {
             let res = &mut *(user_data as *mut Vec<SectionDetails>);
 
-            let id: String = NativePointer((*details).id as *mut _)
-                .try_into()
-                .unwrap_or_default();
-            let name: String = NativePointer((*details).name as *mut _)
-                .try_into()
-                .unwrap_or_default();
+            let id: String = NativePointer((*details).id as *mut _).try_into().unwrap_or_default();
+            let name: String = NativePointer((*details).name as *mut _).try_into().unwrap_or_default();
             let address = (*details).address as usize;
             let size = (*details).size as usize;
 

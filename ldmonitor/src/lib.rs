@@ -202,11 +202,7 @@ impl DlopenMonitor {
     ///
     /// # Returns
     /// 匹配到的 DlopenInfo，超时返回 None
-    pub fn wait_for_path_timeout(
-        &self,
-        path_pattern: &str,
-        timeout: std::time::Duration,
-    ) -> Option<DlopenInfo> {
+    pub fn wait_for_path_timeout(&self, path_pattern: &str, timeout: std::time::Duration) -> Option<DlopenInfo> {
         let start = std::time::Instant::now();
         while start.elapsed() < timeout {
             if let Ok(info) = self.receiver.recv_timeout(timeout - start.elapsed()) {
@@ -226,10 +222,7 @@ async fn run_monitor(
     sender: Sender<DlopenInfo>,
     stop_flag: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
-    let mut ebpf = Ebpf::load(aya::include_bytes_aligned!(concat!(
-        env!("OUT_DIR"),
-        "/ldmonitor"
-    )))?;
+    let mut ebpf = Ebpf::load(aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/ldmonitor")))?;
 
     let program: &mut UProbe = ebpf.program_mut("ldmonitor").unwrap().try_into()?;
     program.load()?;

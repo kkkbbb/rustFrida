@@ -7,8 +7,8 @@ use std::ffi::CStr;
 
 /// Re-export types from ffi
 pub use ffi::{
-    AnalysisType, ConditionType, InstPosition, MemoryAccess, MemoryAccessFlags, MemoryAccessType,
-    OperandFlag, OperandType, RegisterAccessType, VMAction, VMEvent, VMState,
+    AnalysisType, ConditionType, InstPosition, MemoryAccess, MemoryAccessFlags, MemoryAccessType, OperandFlag,
+    OperandType, RegisterAccessType, VMAction, VMEvent, VMState,
 };
 
 /// Callback ID

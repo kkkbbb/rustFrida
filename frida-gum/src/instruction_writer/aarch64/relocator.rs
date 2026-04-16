@@ -11,24 +11,16 @@ pub struct Aarch64Relocator {
 impl Relocator for Aarch64Relocator {
     fn new(input_code: u64, output: &mut Aarch64InstructionWriter) -> Self {
         extern "C" {
-            fn gum_arm64_relocator_new(
-                input_code: *const c_void,
-                output: *mut c_void,
-            ) -> *mut c_void;
+            fn gum_arm64_relocator_new(input_code: *const c_void, output: *mut c_void) -> *mut c_void;
         }
         Self {
-            inner: unsafe {
-                gum_arm64_relocator_new(input_code as *const c_void, output.writer as *mut c_void)
-            },
+            inner: unsafe { gum_arm64_relocator_new(input_code as *const c_void, output.writer as *mut c_void) },
         }
     }
 
     fn read_one(&mut self) -> (u32, Insn) {
         extern "C" {
-            fn gum_arm64_relocator_read_one(
-                relocator: *mut c_void,
-                instruction: *mut *const cs_insn,
-            ) -> u32;
+            fn gum_arm64_relocator_read_one(relocator: *mut c_void, instruction: *mut *const cs_insn) -> u32;
         }
 
         let mut insn_addr: *const cs_insn = core::ptr::null_mut();

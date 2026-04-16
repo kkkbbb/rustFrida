@@ -1,16 +1,41 @@
 //! crash/panic 处理模块 - 安装信号处理器和 panic hook
+//!
+//! 关键设计: 必须正确 chain 到旧的信号处理器（特别是 ART 的 FaultManager）。
+//! ART 运行时依赖 SIGSEGV handler 实现隐式空指针检查、栈溢出检测等。
+//! 如果不 chain，app 在触发 ART 隐式 null check 时会直接崩溃，
+//! 而不是正常抛出 NullPointerException。
 
 use crate::communication::{log_msg, write_stream_raw};
 use libc::{
-    c_char, c_int, c_void, sigaction, siginfo_t, SA_ONSTACK, SA_SIGINFO, SIGABRT, SIGBUS, SIGFPE,
-    SIGILL, SIGSEGV, SIGTRAP,
+    c_char, c_int, c_void, sigaction, siginfo_t, SA_ONSTACK, SA_SIGINFO, SIGABRT, SIGBUS, SIGFPE, SIGILL, SIGSEGV,
+    SIGTRAP,
 };
 use std::ffi::CStr;
 use std::mem::zeroed;
 use std::process;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(feature = "frida-gum")]
 use frida_gum::ModuleMap;
+
+// ============================================================================
+// 旧信号处理器存储（用于 chain）
+// ============================================================================
+// 最大信号编号（SIGTRAP=5, SIGABRT=6, SIGBUS=7, SIGFPE=8, SIGSEGV=11, SIGILL=4）
+// 用 32 个 slot 足够覆盖所有需要的信号
+const MAX_SIG: usize = 32;
+
+/// 保存旧 handler 的 sa_sigaction（函数指针或 SIG_DFL/SIG_IGN）
+static OLD_HANDLER_FN: [AtomicUsize; MAX_SIG] = {
+    const INIT: AtomicUsize = AtomicUsize::new(0);
+    [INIT; MAX_SIG]
+};
+
+/// 保存旧 handler 的 sa_flags（用于判断是 SA_SIGINFO 还是传统 handler）
+static OLD_HANDLER_FLAGS: [AtomicUsize; MAX_SIG] = {
+    const INIT: AtomicUsize = AtomicUsize::new(0);
+    [INIT; MAX_SIG]
+};
 
 /// 内存映射信息
 struct MapEntry {
@@ -71,10 +96,7 @@ fn resolve_symbol(addr: usize) -> (Option<String>, Option<String>, usize) {
 
             // 获取符号名
             let sym_name = if !info.dli_sname.is_null() {
-                CStr::from_ptr(info.dli_sname)
-                    .to_str()
-                    .ok()
-                    .map(|s| s.to_string())
+                CStr::from_ptr(info.dli_sname).to_str().ok().map(|s| s.to_string())
             } else {
                 None
             };
@@ -264,9 +286,108 @@ unsafe fn dump_code_bytes(addr: usize, label: &str) -> String {
     s
 }
 
-/// 信号处理函数 - 打印崩溃信息和backtrace
+// ============================================================================
+// 信号处理函数
+// ============================================================================
+
+/// 64 字节全零 dummy OAT header — WalkStack NULL header 修复用
+static DUMMY_OAT_HEADER_BUF: [u8; 64] = [0u8; 64];
+
+/// 使用 dladdr 快速判断崩溃 PC 是否在 agent 代码（memfd 加载的 SO）中
+unsafe fn is_crash_in_agent(ucontext: *mut c_void) -> bool {
+    let pc = match extract_pc_from_ucontext(ucontext) {
+        Some(pc) => pc,
+        None => return false,
+    };
+    let mut info: DlInfo = zeroed();
+    if dladdr(pc as *const c_void, &mut info) != 0 && !info.dli_fname.is_null() {
+        let fname = CStr::from_ptr(info.dli_fname);
+        if let Ok(s) = fname.to_str() {
+            return s.contains("memfd:");
+        }
+    }
+    false
+}
+
+/// chain 到旧的信号处理器
+/// 返回 true 表示已成功 chain（旧 handler 存在且不是 SIG_DFL/SIG_IGN）
+unsafe fn chain_to_old_handler(sig: c_int, info: *mut siginfo_t, ucontext: *mut c_void) -> bool {
+    if (sig as usize) >= MAX_SIG {
+        return false;
+    }
+
+    let old_fn = OLD_HANDLER_FN[sig as usize].load(Ordering::Acquire);
+    let old_flags = OLD_HANDLER_FLAGS[sig as usize].load(Ordering::Acquire);
+
+    // SIG_DFL = 0, SIG_IGN = 1
+    if old_fn <= 1 {
+        return false;
+    }
+
+    if (old_flags & SA_SIGINFO as usize) != 0 {
+        // SA_SIGINFO 风格 handler（ART FaultManager 使用这种）
+        let handler: extern "C" fn(c_int, *mut siginfo_t, *mut c_void) = std::mem::transmute(old_fn);
+        handler(sig, info, ucontext);
+    } else {
+        // 传统风格 handler
+        let handler: extern "C" fn(c_int) = std::mem::transmute(old_fn);
+        handler(sig);
+    }
+
+    true
+}
+
 extern "C" fn crash_signal_handler(sig: c_int, info: *mut siginfo_t, ucontext: *mut c_void) {
     unsafe {
+        // --- WalkStack/GetDexPc NULL OatQuickMethodHeader 修复 (API 36) ---
+        // ART 的 WalkStack/GetDexPc/DecodeGcMasksOnly 在处理被 hook 方法的栈帧时，
+        // 可能对 NULL OatQuickMethodHeader 执行字段读取，既可能是 NULL+0x18，
+        // 也可能是 NULL+0x0 等前 64 字节访问。
+        // 修复: 解码当前 load 指令找到 base 寄存器 Xn，将其指向全零 dummy buffer。
+        if sig == SIGSEGV && !info.is_null() && !ucontext.is_null() {
+            let fault_addr = (*info).si_addr() as u64;
+            if fault_addr < DUMMY_OAT_HEADER_BUF.len() as u64 {
+                // bionic ucontext_t 布局: mcontext_t at offset 176
+                // regs[0..30] at +8, sp at +256, pc at +264
+                let uc_raw = ucontext as *mut u8;
+                let regs_ptr = uc_raw.add(176 + 8) as *mut u64;
+                let pc = *(uc_raw.add(176 + 264) as *const u64);
+                // 读取崩溃指令 (ARM64 little-endian 4 bytes)
+                let insn = *(pc as *const u32);
+                // 解码 LDR (unsigned offset): 1x11 1001 01ii iiii iiii iinn nnnt tttt
+                // 或 LDR Wt: 1011 1001 01.. ....
+                // 提取 Rn (base register): bits [9:5]
+                let is_ldr_unsigned = (insn & 0x3B000000) == 0x39000000;
+                if is_ldr_unsigned {
+                    let rn = ((insn >> 5) & 0x1F) as usize;
+                    if rn < 31 && *regs_ptr.add(rn) == 0 {
+                        *regs_ptr.add(rn) = DUMMY_OAT_HEADER_BUF.as_ptr() as u64;
+                        return; // 恢复执行
+                    }
+                }
+            }
+        }
+
+        // --- 信号 chain 策略 ---
+        // 1. 如果崩溃不在 agent 代码中，优先 chain 到旧 handler（ART FaultManager 等）
+        //    ART 需要 SIGSEGV 实现隐式 null check、栈溢出检测、安全点等
+        // 2. 如果崩溃在 agent 代码中，先做 crash 报告，再 chain
+        // 3. 如果没有旧 handler，做 crash 报告后 SIG_DFL 终止
+
+        let in_agent = is_crash_in_agent(ucontext);
+
+        if !in_agent {
+            // 非 agent 代码中的信号 → 直接 chain 到旧 handler
+            // ART 的 FaultManager 会处理隐式 null check (修改 ucontext 抛 NPE) 并返回
+            if chain_to_old_handler(sig, info, ucontext) {
+                return; // 旧 handler 已处理（如 ART null check），恢复执行
+            }
+            // 无旧 handler，fall through 到 crash 报告
+        }
+
+        // --- Crash 报告 ---
+        // 仅在 agent 代码崩溃或无旧 handler 时执行
+
         let sig_name = match sig {
             SIGSEGV => "SIGSEGV (Segmentation Fault)",
             SIGBUS => "SIGBUS (Bus Error)",
@@ -277,11 +398,7 @@ extern "C" fn crash_signal_handler(sig: c_int, info: *mut siginfo_t, ucontext: *
             _ => "Unknown signal",
         };
 
-        let fault_addr = if !info.is_null() {
-            (*info).si_addr() as usize
-        } else {
-            0
-        };
+        let fault_addr = if !info.is_null() { (*info).si_addr() as usize } else { 0 };
 
         // 构建崩溃信息
         let mut crash_msg = format!(
@@ -377,13 +494,23 @@ extern "C" fn crash_signal_handler(sig: c_int, info: *mut siginfo_t, ucontext: *
         // 尝试通过 socket 发送
         write_stream_raw(crash_msg.as_bytes());
 
-        // 重新抛出信号以便系统处理
+        // agent 代码崩溃 → 尝试 chain 到旧 handler（让系统生成 tombstone）
+        if in_agent {
+            if chain_to_old_handler(sig, info, ucontext) {
+                return; // 旧 handler 也处理了（不太可能，但安全起见）
+            }
+        }
+
+        // 重新抛出信号以便系统处理（生成 tombstone/core dump）
         libc::signal(sig, libc::SIG_DFL);
         libc::raise(sig);
     }
 }
 
 /// 安装崩溃信号处理器
+///
+/// 关键: 通过 sigaction 的第三个参数保存旧 handler，在 crash_signal_handler 中
+/// 正确 chain。这样 ART 的 FaultManager 等关键 handler 不会被破坏。
 pub(crate) fn install_crash_handlers() {
     let signals = [SIGSEGV, SIGBUS, SIGABRT, SIGFPE, SIGILL, SIGTRAP];
 
@@ -394,13 +521,44 @@ pub(crate) fn install_crash_handlers() {
             sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
             libc::sigemptyset(&mut sa.sa_mask);
 
-            if sigaction(sig, &sa, std::ptr::null_mut()) != 0 {
+            let mut old_sa: sigaction = std::mem::zeroed();
+
+            if sigaction(sig, &sa, &mut old_sa) == 0 {
+                // 保存旧 handler 用于 chain
+                if (sig as usize) < MAX_SIG {
+                    OLD_HANDLER_FN[sig as usize].store(old_sa.sa_sigaction, Ordering::Release);
+                    OLD_HANDLER_FLAGS[sig as usize].store(old_sa.sa_flags as usize, Ordering::Release);
+                }
+            } else {
                 log_msg(format!("Failed to install handler for signal {}\n", sig));
             }
         }
     }
+}
 
-    // log_msg("Crash signal handlers installed\n".to_string());
+/// 卸载崩溃信号处理器，恢复旧的 handler
+///
+/// 必须在 agent SO 被 dlclose 之前调用！否则 sigaction 表中的函数指针
+/// 指向已卸载的内存，任何信号触发都会导致进程崩溃。
+pub(crate) fn uninstall_crash_handlers() {
+    let signals = [SIGSEGV, SIGBUS, SIGABRT, SIGFPE, SIGILL, SIGTRAP];
+
+    for &sig in &signals {
+        if (sig as usize) >= MAX_SIG {
+            continue;
+        }
+        unsafe {
+            let old_fn = OLD_HANDLER_FN[sig as usize].load(Ordering::Acquire);
+            let old_flags = OLD_HANDLER_FLAGS[sig as usize].load(Ordering::Acquire);
+
+            let mut sa: sigaction = std::mem::zeroed();
+            sa.sa_sigaction = old_fn;
+            sa.sa_flags = old_flags as c_int;
+            libc::sigemptyset(&mut sa.sa_mask);
+
+            sigaction(sig, &sa, std::ptr::null_mut());
+        }
+    }
 }
 
 /// 安装Rust panic hook，捕获panic并输出带符号的backtrace
@@ -422,12 +580,7 @@ pub(crate) fn install_panic_hook() {
             .payload()
             .downcast_ref::<&str>()
             .copied()
-            .or_else(|| {
-                panic_info
-                    .payload()
-                    .downcast_ref::<String>()
-                    .map(|s| s.as_str())
-            })
+            .or_else(|| panic_info.payload().downcast_ref::<String>().map(|s| s.as_str()))
             .unwrap_or("unknown panic");
 
         let msg = format!(

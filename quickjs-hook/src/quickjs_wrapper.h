@@ -70,6 +70,14 @@ int qjs_value_to_u64(JSContext *ctx, uint64_t *pres, JSValue val);
 /* Stack top update for cross-thread usage */
 void qjs_update_stack_top(JSContext *ctx);
 
+/* Throw an Error-class exception with a full-length message (bypasses
+ * QuickJS's 256-byte vsnprintf truncation in JS_ThrowInternalError et al).
+ * error_class_name: "InternalError" / "TypeError" / "Error" / NULL (→ Error) */
+JSValue qjs_throw_error_with_message(JSContext *ctx,
+                                     const char *error_class_name,
+                                     const char *message,
+                                     size_t message_len);
+
 /* Constants */
 JSValue qjs_null(void);
 JSValue qjs_undefined(void);

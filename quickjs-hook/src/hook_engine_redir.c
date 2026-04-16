@@ -86,7 +86,7 @@ static void* prepare_redirect_entry(uint64_t key, HookRedirectEntry** out_entry)
     }
     memset(entry, 0, sizeof(HookRedirectEntry));
 
-    /* Allocate thunk memory */
+    /* redirect/native thunk 通过指针间接调用，不需要近距离分配 */
     void* thunk_mem = hook_alloc(THUNK_ALLOC_SIZE);
     if (!thunk_mem) {
         pthread_mutex_unlock(&g_engine.lock);
@@ -177,6 +177,7 @@ void* hook_remove_redirect(uint64_t key) {
  */
 static void* generate_native_hook_thunk(HookCallback on_enter,
                                          void* user_data,
+                                         uint64_t current_pc_hint,
                                          void* thunk_mem,
                                          size_t* thunk_size_out) {
     Arm64Writer w;
@@ -184,14 +185,28 @@ static void* generate_native_hook_thunk(HookCallback on_enter,
 
     uint64_t stack_size = 352;
 
-    /* Save HookContext (pc=0: not meaningful for native hooks, no trampoline) */
-    emit_save_hook_context(&w, 0, 0);
+    /* Save HookContext.
+     * current_pc_hint != 0 时，表示这是从 compiled+router Java hook 进入的
+     * native thunk；此时 HookContext.pc 也暴露为原始方法内的可见 PC。 */
+    emit_save_hook_context(&w, current_pc_hint, 0);
 
     /* Call on_enter(ctx, user_data) */
     emit_callback_call(&w, on_enter, user_data);
 
-    /* Restore x0 + LR, deallocate stack, RET */
-    emit_replace_epilogue(&w);
+    /* Restore x0 */
+    arm64_writer_put_ldr_reg_reg_offset(&w, ARM64_REG_X0, ARM64_REG_SP, 0);
+
+    /* 统一从 saved LR 恢复 (= jni_trampoline 内的返回地址)。
+     * 不再区分 compiled/shared_stub 路径。让 RET 回到 jni_trampoline epilogue，
+     * 由 GenericJniMethodEnd 正常清理 JNI transition frame，避免 frame 泄漏。 */
+    arm64_writer_put_ldr_reg_reg_offset(&w, ARM64_REG_X30, ARM64_REG_SP, 240); /* saved LR */
+
+    /* Restore x18 (platform register) before returning */
+    arm64_writer_put_ldr_reg_reg_offset(&w, ARM64_REG_X18, ARM64_REG_SP, 144);
+
+    /* Deallocate stack and return */
+    arm64_writer_put_add_reg_reg_imm(&w, ARM64_REG_SP, ARM64_REG_SP, stack_size);
+    arm64_writer_put_ret(&w);
 
     arm64_writer_flush(&w);
     *thunk_size_out = arm64_writer_offset(&w);
@@ -203,18 +218,20 @@ static void* generate_native_hook_thunk(HookCallback on_enter,
 /* Create a native hook trampoline — called by ART's JNI trampoline as a native function.
  * Returns the thunk address to be stored in ArtMethod.data_ field.
  * Uses the redirect entry list for tracking (shares hook_remove_redirect for cleanup). */
-void* hook_create_native_trampoline(uint64_t key, HookCallback on_enter, void* user_data) {
+void* hook_create_native_trampoline(uint64_t key, HookCallback on_enter, void* user_data,
+                                    uint64_t current_pc_hint) {
     if (!g_engine.initialized || !on_enter)
         return NULL;
 
     pthread_mutex_lock(&g_engine.lock);
 
     HookRedirectEntry* entry;
+    /* native trampoline 通过 ArtMethod.data_ 间接调用，不需要 ADRP 近距离 */
     void* thunk_mem = prepare_redirect_entry(key, &entry);
     if (!thunk_mem) return NULL;
 
     size_t thunk_size = 0;
-    void* thunk = generate_native_hook_thunk(on_enter, user_data, thunk_mem, &thunk_size);
+    void* thunk = generate_native_hook_thunk(on_enter, user_data, current_pc_hint, thunk_mem, &thunk_size);
     if (!thunk) {
         pthread_mutex_unlock(&g_engine.lock);
         return NULL;

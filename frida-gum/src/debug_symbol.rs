@@ -30,14 +30,12 @@ impl Symbol {
 
     /// Name of the symbol
     pub fn module_name(&self) -> Result<&str, Utf8Error> {
-        unsafe { CStr::from_ptr(self.gum_debug_symbol_details.module_name.as_ptr().cast()) }
-            .to_str()
+        unsafe { CStr::from_ptr(self.gum_debug_symbol_details.module_name.as_ptr().cast()) }.to_str()
     }
 
     /// Module name owning this symbol
     pub fn symbol_name(&self) -> Result<&str, Utf8Error> {
-        unsafe { CStr::from_ptr(self.gum_debug_symbol_details.symbol_name.as_ptr().cast()) }
-            .to_str()
+        unsafe { CStr::from_ptr(self.gum_debug_symbol_details.symbol_name.as_ptr().cast()) }.to_str()
     }
 
     /// File name owning this symbol
@@ -56,14 +54,8 @@ pub struct DebugSymbol {}
 impl DebugSymbol {
     /// Get debug symbol details for address
     pub fn from_address<N: AsRef<NativePointer>>(address: N) -> Option<Symbol> {
-        let mut gum_symbol_details: GumDebugSymbolDetails =
-            unsafe { MaybeUninit::zeroed().assume_init() };
-        match unsafe {
-            gum_symbol_details_from_address(
-                address.as_ref().into(),
-                &mut gum_symbol_details as *mut _,
-            )
-        } {
+        let mut gum_symbol_details: GumDebugSymbolDetails = unsafe { MaybeUninit::zeroed().assume_init() };
+        match unsafe { gum_symbol_details_from_address(address.as_ref().into(), &mut gum_symbol_details as *mut _) } {
             1 => Some(Symbol {
                 gum_debug_symbol_details: gum_symbol_details,
             }),

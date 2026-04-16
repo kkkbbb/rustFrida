@@ -18,21 +18,13 @@ pub(super) unsafe extern "C" fn js_java_methods(
     argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
     if argc < 1 {
-        return ffi::JS_ThrowTypeError(
-            ctx,
-            b"_methods() requires 1 argument: className\0".as_ptr() as *const _,
-        );
+        return ffi::JS_ThrowTypeError(ctx, b"_methods() requires 1 argument: className\0".as_ptr() as *const _);
     }
 
     let class_arg = JSValue(*argv);
     let class_name = match class_arg.to_string(ctx) {
         Some(s) => s,
-        None => {
-            return ffi::JS_ThrowTypeError(
-                ctx,
-                b"argument must be a class name string\0".as_ptr() as *const _,
-            )
-        }
+        None => return ffi::JS_ThrowTypeError(ctx, b"argument must be a class name string\0".as_ptr() as *const _),
     };
 
     let env = match ensure_jni_initialized() {

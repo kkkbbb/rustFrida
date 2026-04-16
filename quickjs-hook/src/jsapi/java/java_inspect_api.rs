@@ -64,21 +64,19 @@ pub(super) unsafe extern "C" fn js_java_inspect_art_method(
         }
     };
 
-    let (art_method, is_static) =
-        match resolve_art_method(env, &class_name, &method_name, &actual_sig, force_static) {
-            Ok(r) => r,
-            Err(msg) => {
-                let err = CString::new(msg).unwrap();
-                return ffi::JS_ThrowInternalError(ctx, err.as_ptr());
-            }
-        };
+    let (art_method, is_static) = match resolve_art_method(env, &class_name, &method_name, &actual_sig, force_static) {
+        Ok(r) => r,
+        Err(msg) => {
+            let err = CString::new(msg).unwrap();
+            return ffi::JS_ThrowInternalError(ctx, err.as_ptr());
+        }
+    };
 
     let spec = get_art_method_spec(env, art_method);
     let bridge = find_art_bridge_functions(env, spec.entry_point_offset);
 
     // 读取当前字段值
-    let access_flags =
-        std::ptr::read_volatile((art_method as usize + spec.access_flags_offset) as *const u32);
+    let access_flags = std::ptr::read_volatile((art_method as usize + spec.access_flags_offset) as *const u32);
     let data = std::ptr::read_volatile((art_method as usize + spec.data_offset) as *const u64);
     let entry_point = read_entry_point(art_method, spec.entry_point_offset);
     let has_independent_code = !is_art_quick_entrypoint(entry_point, bridge);
@@ -94,24 +92,12 @@ pub(super) unsafe extern "C" fn js_java_inspect_art_method(
     set_js_u64_property(ctx, result, "entryPoint", entry_point);
     set_js_u64_property(ctx, result, "data", data);
     JSValue(result).set_property(ctx, "isStatic", JSValue::bool(is_static));
-    JSValue(result).set_property(
-        ctx,
-        "hasIndependentCode",
-        JSValue::bool(has_independent_code),
-    );
+    JSValue(result).set_property(ctx, "hasIndependentCode", JSValue::bool(has_independent_code));
 
     // offsets 子对象
     let offsets = ffi::JS_NewObject(ctx);
-    JSValue(offsets).set_property(
-        ctx,
-        "accessFlags",
-        JSValue::int(spec.access_flags_offset as i32),
-    );
-    JSValue(offsets).set_property(
-        ctx,
-        "entryPoint",
-        JSValue::int(spec.entry_point_offset as i32),
-    );
+    JSValue(offsets).set_property(ctx, "accessFlags", JSValue::int(spec.access_flags_offset as i32));
+    JSValue(offsets).set_property(ctx, "entryPoint", JSValue::int(spec.entry_point_offset as i32));
     JSValue(offsets).set_property(ctx, "data", JSValue::int(spec.data_offset as i32));
     JSValue(offsets).set_property(ctx, "size", JSValue::int(spec.size as i32));
     JSValue(result).set_property(ctx, "offsets", JSValue(offsets));
@@ -119,35 +105,15 @@ pub(super) unsafe extern "C" fn js_java_inspect_art_method(
     // bridges 子对象
     let bridges = ffi::JS_NewObject(ctx);
     set_js_u64_property(ctx, bridges, "nterp", bridge.nterp_entry_point);
-    set_js_u64_property(
-        ctx,
-        bridges,
-        "interpreterBridge",
-        bridge.quick_to_interpreter_bridge,
-    );
-    set_js_u64_property(
-        ctx,
-        bridges,
-        "jniTrampoline",
-        bridge.quick_generic_jni_trampoline,
-    );
-    set_js_u64_property(
-        ctx,
-        bridges,
-        "resolution",
-        bridge.quick_resolution_trampoline,
-    );
+    set_js_u64_property(ctx, bridges, "interpreterBridge", bridge.quick_to_interpreter_bridge);
+    set_js_u64_property(ctx, bridges, "jniTrampoline", bridge.quick_generic_jni_trampoline);
+    set_js_u64_property(ctx, bridges, "resolution", bridge.quick_resolution_trampoline);
     JSValue(result).set_property(ctx, "bridges", JSValue(bridges));
 
     // flags 常量子对象（方便 JS 层使用）
     let consts = ffi::JS_NewObject(ctx);
     set_js_u64_property(ctx, consts, "kAccNative", K_ACC_NATIVE as u64);
-    set_js_u64_property(
-        ctx,
-        consts,
-        "kAccCompileDontBother",
-        k_acc_compile_dont_bother() as u64,
-    );
+    set_js_u64_property(ctx, consts, "kAccCompileDontBother", k_acc_compile_dont_bother() as u64);
     set_js_u64_property(
         ctx,
         consts,
@@ -166,19 +132,9 @@ pub(super) unsafe extern "C" fn js_java_inspect_art_method(
         "kAccNterpEntryPointFastPath",
         K_ACC_NTERP_ENTRY_POINT_FAST_PATH as u64,
     );
-    set_js_u64_property(
-        ctx,
-        consts,
-        "kAccSkipAccessChecks",
-        K_ACC_SKIP_ACCESS_CHECKS as u64,
-    );
+    set_js_u64_property(ctx, consts, "kAccSkipAccessChecks", K_ACC_SKIP_ACCESS_CHECKS as u64);
     set_js_u64_property(ctx, consts, "kAccFastNative", K_ACC_FAST_NATIVE as u64);
-    set_js_u64_property(
-        ctx,
-        consts,
-        "kAccCriticalNative",
-        K_ACC_CRITICAL_NATIVE as u64,
-    );
+    set_js_u64_property(ctx, consts, "kAccCriticalNative", K_ACC_CRITICAL_NATIVE as u64);
     JSValue(result).set_property(ctx, "consts", JSValue(consts));
 
     result
@@ -214,20 +170,14 @@ pub(super) unsafe extern "C" fn js_java_set_forced_interpret_only(
     let spec = match get_instrumentation_spec() {
         Some(s) => s,
         None => {
-            return ffi::JS_ThrowInternalError(
-                ctx,
-                b"InstrumentationSpec not available\0".as_ptr() as *const _,
-            );
+            return ffi::JS_ThrowInternalError(ctx, b"InstrumentationSpec not available\0".as_ptr() as *const _);
         }
     };
 
     let runtime = match get_runtime_addr() {
         Some(r) => r,
         None => {
-            return ffi::JS_ThrowInternalError(
-                ctx,
-                b"Cannot get Runtime address\0".as_ptr() as *const _,
-            );
+            return ffi::JS_ThrowInternalError(ctx, b"Cannot get Runtime address\0".as_ptr() as *const _);
         }
     };
 
@@ -236,10 +186,7 @@ pub(super) unsafe extern "C" fn js_java_set_forced_interpret_only(
         let ptr = *((runtime as usize + spec.runtime_instrumentation_offset) as *const u64);
         let stripped = ptr & PAC_STRIP_MASK;
         if stripped == 0 {
-            return ffi::JS_ThrowInternalError(
-                ctx,
-                b"Instrumentation pointer is null\0".as_ptr() as *const _,
-            );
+            return ffi::JS_ThrowInternalError(ctx, b"Instrumentation pointer is null\0".as_ptr() as *const _);
         }
         stripped as usize
     } else {
@@ -251,7 +198,7 @@ pub(super) unsafe extern "C" fn js_java_set_forced_interpret_only(
     let new_val: u8 = if enable { 1 } else { 0 };
     std::ptr::write_volatile(field_addr, new_val);
 
-    crate::jsapi::console::output_message(&format!(
+    crate::jsapi::console::output_verbose(&format!(
         "[test] forced_interpret_only_: {} → {} (addr={:#x})",
         old_val, new_val, field_addr as u64
     ));
@@ -292,23 +239,16 @@ pub(super) unsafe extern "C" fn js_java_init_art_controller(
 
     if method_id.is_null() {
         jni_check_exc(env);
-        return ffi::JS_ThrowInternalError(
-            ctx,
-            b"GetMethodID toString failed\0".as_ptr() as *const _,
-        );
+        return ffi::JS_ThrowInternalError(ctx, b"GetMethodID toString failed\0".as_ptr() as *const _);
     }
 
     let art_method = method_id as u64;
     let spec = get_art_method_spec(env, art_method);
     let bridge = find_art_bridge_functions(env, spec.entry_point_offset);
 
-    ensure_art_controller_initialized(
-        bridge,
-        spec.entry_point_offset,
-        env as *mut std::ffi::c_void,
-    );
+    ensure_art_controller_initialized(bridge, spec.entry_point_offset, env as *mut std::ffi::c_void);
 
-    crate::jsapi::console::output_message("[test] artController Layer 1+2 已初始化 (无方法 hook)");
+    crate::jsapi::console::output_verbose("[test] artController Layer 1+2 已初始化 (无方法 hook)");
 
     JSValue::bool(true).raw()
 }

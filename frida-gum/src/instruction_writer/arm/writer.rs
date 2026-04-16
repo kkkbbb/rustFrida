@@ -22,15 +22,11 @@ impl InstructionWriter for ArmInstructionWriter {
     }
 
     fn can_branch_directly_between(&self, source: u64, target: u64) -> bool {
-        unsafe {
-            gum_sys::gum_arm_writer_can_branch_directly_between(self.writer, source, target) != 0
-        }
+        unsafe { gum_sys::gum_arm_writer_can_branch_directly_between(self.writer, source, target) != 0 }
     }
 
     fn put_bytes(&self, bytes: &[u8]) -> bool {
-        unsafe {
-            gum_sys::gum_arm_writer_put_bytes(self.writer, bytes.as_ptr(), bytes.len() as u32) != 0
-        }
+        unsafe { gum_sys::gum_arm_writer_put_bytes(self.writer, bytes.as_ptr(), bytes.len() as u32) != 0 }
     }
 
     fn put_label(&self, id: u64) -> bool {

@@ -1,6 +1,5 @@
 #![cfg(all(target_os = "android", target_arch = "aarch64"))]
 
-use crate::injection::DebugInjectMode;
 use clap::{ArgGroup, Parser};
 
 fn parse_pid(s: &str) -> std::result::Result<i32, String> {
@@ -28,8 +27,18 @@ inline hook、Frida Stalker 追踪等功能。
   rustfrida --pid 1234 -l script.js            # 注入并执行 JS 脚本
   rustfrida --pid 1234 --verbose               # 显示详细注入调试信息
 
+属性伪装:
+  rustfrida --dump-props default                                    # Dump 属性快照
+  rustfrida --set-prop default ro.build.fingerprint=google/...      # 修改属性值
+  rustfrida --set-prop default ro.debuggable=0                      # 可多次调用
+  rustfrida --spawn com.app --profile default                       # Spawn 并应用
+
+Server daemon 模式（多 session 并发）:
+  rustfrida --server                                                # 启动 server
+  rustfrida --server --profile default                              # 启动 + 属性伪装持续生效
+
 注入后进入 REPL，输入 help 查看可用命令（jsinit / loadjs / jsrepl / jhook 等）。",
-    group(ArgGroup::new("target").required(true).args(["pid", "watch_so", "name", "spawn"]))
+    group(ArgGroup::new("target").required(true).args(["pid", "watch_so", "name", "spawn", "dump_props", "set_prop", "del_prop", "repack_props", "server"]))
 )]
 pub(crate) struct Args {
     /// 目标进程的PID（与 --watch-so、--name、--spawn 互斥）
@@ -81,9 +90,69 @@ pub(crate) struct Args {
     #[arg(short = 'v', long = "verbose")]
     pub(crate) verbose: bool,
 
-    /// Debug 注入模式：隔离测试各注入组件的检测向量
+    /// Dump 本机属性到 profile（独立操作，不注入进程）
     ///
-    /// 注入后监控进程存活状态 15 秒，不启动 REPL
-    #[arg(long = "debug-inject", value_name = "MODE", value_enum)]
-    pub(crate) debug_inject: Option<DebugInjectMode>,
+    /// 复制 /dev/__properties__/ 二进制文件到 profile 目录，
+    /// 之后用 --set-prop 修改单个属性值。
+    #[arg(
+        long = "dump-props",
+        value_name = "PROFILE",
+        conflicts_with_all = ["pid", "watch_so", "name", "spawn", "set_prop"]
+    )]
+    pub(crate) dump_props: Option<String>,
+
+    /// 修改 profile 中的属性值（类似 magisk resetprop）
+    ///
+    /// 直接 patch profile 目录中的二进制属性区域文件。可多次调用设置不同属性。
+    /// 格式: --set-prop <PROFILE> <key=value>
+    #[arg(
+        long = "set-prop",
+        value_name = "PROFILE",
+        conflicts_with_all = ["pid", "watch_so", "name", "spawn", "dump_props"],
+        num_args = 2,
+        value_names = ["PROFILE", "KEY=VALUE"]
+    )]
+    pub(crate) set_prop: Option<Vec<String>>,
+
+    /// 删除 profile 中的属性
+    ///
+    /// 清零属性值和 serial，使属性不可读。
+    /// 格式: --del-prop <PROFILE> <key>
+    #[arg(
+        long = "del-prop",
+        conflicts_with_all = ["pid", "watch_so", "name", "spawn", "dump_props", "set_prop", "repack_props"],
+        num_args = 2,
+        value_names = ["PROFILE", "KEY"]
+    )]
+    pub(crate) del_prop: Option<Vec<String>>,
+
+    /// 重排 profile 消除空洞（重新 dump + 重放变更日志）
+    #[arg(
+        long = "repack-props",
+        value_name = "PROFILE",
+        conflicts_with_all = ["pid", "watch_so", "name", "spawn", "dump_props", "set_prop", "del_prop"]
+    )]
+    pub(crate) repack_props: Option<String>,
+
+    /// 指定属性覆盖 profile（--spawn 或 --server 模式可用）
+    #[arg(long = "profile", value_name = "NAME")]
+    pub(crate) profile: Option<String>,
+
+    /// Server daemon 模式：多 session 并发 spawn/inject，profile 持续生效
+    ///
+    /// 启动后进入 server REPL，支持同时管理多个注入 session。
+    /// 配合 --profile 使用可在整个 server 生命周期内持续生效。
+    #[arg(long = "server", conflicts_with_all = ["pid", "watch_so", "name", "spawn"])]
+    pub(crate) server: bool,
+
+    /// 启动 HTTP RPC 服务器，暴露 agent 端 `rpc.exports` 注册的方法。
+    ///
+    /// 格式: --rpc-port <PORT> 或 --rpc-port <HOST:PORT>（默认绑定 0.0.0.0）。
+    /// 路由：
+    ///   GET  /sessions                        列出 session
+    ///   POST /rpc/<session>/<method>          调用 rpc.exports[method]，请求体为 JSON 参数数组
+    ///
+    /// 在 legacy 模式下 session_id 为 0，在 --server 模式下为 list 命令显示的 id。
+    #[arg(long = "rpc-port", value_name = "PORT_OR_ADDR")]
+    pub(crate) rpc_port: Option<String>,
 }

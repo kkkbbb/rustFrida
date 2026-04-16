@@ -11,9 +11,7 @@ fn main() -> anyhow::Result<()> {
         .find(|cargo_metadata::Package { name, .. }| name.as_str() == "ldmonitor-ebpf")
         .ok_or_else(|| anyhow!("ldmonitor-ebpf package not found"))?;
     let cargo_metadata::Package {
-        name,
-        manifest_path,
-        ..
+        name, manifest_path, ..
     } = ebpf_package;
     let ebpf_package = aya_build::Package {
         name: name.as_str(),

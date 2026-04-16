@@ -1,185 +1,8 @@
 #![cfg(all(target_os = "android", target_arch = "aarch64"))]
 
-use libc::{
-    c_void, close, dlerror, dlopen, dlsym, free, malloc, memfd_create, mmap, munmap,
-    pthread_create, pthread_detach, read, socketpair, strlen, write,
-};
-use paste::paste;
-use std::os::raw::c_int;
-
-use crate::log_step;
-use crate::process::{call_target_function, write_bytes, write_memory};
-
-extern "C" {
-    fn android_dlopen_ext(
-        filename: *const std::os::raw::c_char,
-        flag: c_int,
-        extinfo: *const c_void,
-    ) -> *mut c_void;
-}
-
-/// 定义需要获取偏移的函数列表
-macro_rules! define_libc_functions {
-    ($($name:ident),*) => {
-        #[derive(Debug, Default)]
-        pub(crate) struct LibcOffsets {
-            $(pub(crate) $name: usize),*
-        }
-
-        impl LibcOffsets {
-            pub(crate) fn calculate(self_base: usize, target_base: usize) -> Result<Self, String> {
-                $(
-                    let sym_addr = $name as *const () as usize;
-                    if sym_addr < self_base {
-                        return Err(format!(
-                            "符号 {} 地址(0x{:x}) 小于 libc 基址(0x{:x})，请确认 libc 版本匹配",
-                            stringify!($name), sym_addr, self_base
-                        ));
-                    }
-                    let $name = target_base + (sym_addr - self_base);
-                )*
-                Ok(Self { $($name),* })
-            }
-
-            pub(crate) fn print_offsets(&self) {
-                log_step!("目标进程函数地址列表:");
-                $(println!("     {}: 0x{:x}", stringify!($name), self.$name);)*
-            }
-        }
-    };
-}
-
-macro_rules! define_dl_functions {
-    ($($name:ident),*) => {
-        #[derive(Debug, Default)]
-        pub(crate) struct DlOffsets {
-            $(pub(crate) $name: usize),*
-        }
-
-        impl DlOffsets {
-            pub(crate) fn calculate(self_base: usize, target_base: usize) -> Result<Self, String> {
-                $(
-                    let sym_addr = $name as *const () as usize;
-                    if sym_addr < self_base {
-                        return Err(format!(
-                            "符号 {} 地址(0x{:x}) 小于 libdl 基址(0x{:x})，请确认 libdl 版本匹配",
-                            stringify!($name), sym_addr, self_base
-                        ));
-                    }
-                    let $name = target_base + (sym_addr - self_base);
-                )*
-                Ok(Self { $($name),* })
-            }
-
-            pub(crate) fn print_offsets(&self) {
-                log_step!("libdl.so 函数地址列表:");
-                $(println!("     {}: 0x{:x}", stringify!($name), self.$name);)*
-            }
-        }
-    };
-}
-
-// 定义字符串表宏
-// 支持通过 overrides HashMap 覆盖默认值，格式：name=value
-macro_rules! define_string_table {
-    ($(($name:ident, $value:expr)),* $(,)?) => {
-        paste! {
-            #[repr(C)]
-            pub(crate) struct StringTable {
-                $(
-                    pub(crate) $name: u64,
-                    pub(crate) [<$name _len>]: u32,
-                )*
-            }
-
-            // 获取所有可用的字符串名称
-            pub(crate) fn get_string_table_names() -> Vec<&'static str> {
-                vec![$(stringify!($name)),*]
-            }
-
-            #[allow(unused_assignments)]
-            pub(crate) fn write_string_table(pid: i32, malloc_addr: usize, overrides: &std::collections::HashMap<String, String>) -> Result<usize, String> {
-                $(
-                    // 检查是否有覆盖值
-                    let mut $name = if let Some(override_val) = overrides.get(stringify!($name)) {
-                        override_val.as_bytes().to_vec()
-                    } else {
-                        $value.to_vec()
-                    };
-                    $name.push(0); // 添加 NULL 结尾
-                )*
-
-                let strings_len = 0 $(+ $name.len())*;
-                let table_size = std::mem::size_of::<StringTable>();
-                let total_size = table_size + strings_len;
-
-                // 通过 call_target_function 用目标进程的 malloc 分配内存
-                let table_addr = call_target_function(pid, malloc_addr, &[total_size], None)?;
-                let mut string_addr = table_addr + table_size;
-
-                let mut table = StringTable {
-                    $(
-                        $name: 0,
-                        [<$name _len>] : 0,
-                    )*
-                };
-
-                $(
-                    table.$name = string_addr as u64;
-                    // 长度包含最后的 NULL 结尾
-                    table.[<$name _len>] = $name.len() as u32;
-                    write_bytes(pid, string_addr, &$name)?;
-                    string_addr += $name.len();
-                )*
-
-                write_memory(pid, table_addr, &table)?;
-                Ok(table_addr)
-            }
-        }
-    };
-}
-
-// 使用宏定义字符串表
-define_string_table!(
-    (sym_name, b"hello_entry"),
-    (pthread_err, b"pthreadded"),
-    (dlsym_err, b"dlsymFail"),
-    (cmdline, b"novalue"),
-    (output_path, b"novalue"),
-    // 未来添加字符串只需在这里添加新行即可
-);
-
-// 使用宏定义函数列表
-define_libc_functions!(
-    malloc,       // 用于分配内存
-    free,         // 用于释放内存
-    socketpair,   // 用于创建已连接的套接字对
-    read,         // 用于从 socket 读取 agent blob
-    write,        // 用于发送数据
-    close,        // 用于关闭套接字
-    mmap,         // 用于内存映射
-    munmap,       // 用于释放内存映射
-    memfd_create, // 用于创建匿名内存文件
-    pthread_create,
-    pthread_detach,
-    strlen
-);
-
-define_dl_functions!(
-    dlopen, // 动态加载
-    dlsym,  // 动态符号查找
-    dlerror,
-    android_dlopen_ext // fd-based dlopen (绕过 SELinux)
-);
-
-/// 注入参数结构体，传递给 shellcode → agent
-/// ABI 关键：必须与 loader.c 和 agent/src/lib.rs 中的定义完全一致
-#[repr(C)]
-#[derive(Debug, Default, Clone, Copy)]
-pub(crate) struct AgentArgs {
-    pub(crate) table: u64,       // *const StringTable（目标进程内地址）
-    pub(crate) ctrl_fd: i32,     // socketpair fd1（agent 端）
-    pub(crate) agent_memfd: i32, // 目标进程内的 agent.so memfd
+/// 获取所有可用的字符串名称（用于 CLI --string 参数验证）
+pub(crate) fn get_string_table_names() -> Vec<&'static str> {
+    vec!["sym_name", "pthread_err", "dlsym_err", "cmdline", "output_path"]
 }
 
 /// 用户空间寄存器结构体
@@ -190,4 +13,129 @@ pub(crate) struct UserRegs {
     pub(crate) sp: u64,         // SP 栈指针
     pub(crate) pc: u64,         // PC 程序计数器
     pub(crate) pstate: u64,     // 处理器状态
+}
+
+/// ARM64 FP/SIMD 寄存器结构体 (NT_FPREGSET / NT_PRFPREG)
+/// 对应 Linux struct user_fpsimd_state (asm/ptrace.h)
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct UserFpRegs {
+    pub(crate) vregs: [u128; 32], // V0-V31 (128-bit SIMD 寄存器)
+    pub(crate) fpsr: u32,         // 浮点状态寄存器
+    pub(crate) fpcr: u32,         // 浮点控制寄存器
+}
+
+impl Default for UserFpRegs {
+    fn default() -> Self {
+        // 不能用 derive(Default) 因为 [u128; 32] 没有 Default
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+// =============================================================================
+// Frida-style 注入框架结构体
+// ABI 关键：必须与 loader/helpers/ 中的 C 结构体布局完全一致
+// =============================================================================
+
+/// Frida bootstrapper 返回状态码
+#[allow(dead_code)]
+pub(crate) mod bootstrap_status {
+    pub const ALLOCATION_SUCCESS: usize = 0;
+    pub const ALLOCATION_ERROR: usize = 1;
+    pub const SUCCESS: usize = 2;
+    pub const AUXV_NOT_FOUND: usize = 3;
+    pub const TOO_EARLY: usize = 4;
+    pub const LIBC_LOAD_ERROR: usize = 5;
+    pub const LIBC_UNSUPPORTED: usize = 6;
+}
+
+/// Frida loader IPC 消息类型
+#[allow(dead_code)]
+pub(crate) mod message_type {
+    pub const HELLO: u8 = 0;
+    pub const READY: u8 = 1;
+    pub const ACK: u8 = 2;
+    pub const BYE: u8 = 3;
+    pub const ERROR_DLOPEN: u8 = 4;
+    pub const ERROR_DLSYM: u8 = 5;
+}
+
+/// FridaBootstrapContext — bootstrapper 的输入/输出参数
+/// 对应 inject-context.h 中的 struct _FridaBootstrapContext
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FridaBootstrapContext {
+    pub(crate) allocation_base: u64, // void *
+    pub(crate) allocation_size: u64, // size_t
+    pub(crate) page_size: u64,       // size_t
+    pub(crate) fallback_ld: u64,     // const char * (unused on Android)
+    pub(crate) fallback_libc: u64,   // const char * (unused on Android)
+    pub(crate) rtld_flavor: i32,     // FridaRtldFlavor (int)
+    _pad0: i32,                      // 对齐 padding
+    pub(crate) rtld_base: u64,       // void *
+    pub(crate) r_brk: u64,           // void *
+    pub(crate) enable_ctrlfds: i32,
+    pub(crate) ctrlfds: [i32; 2],
+    _pad1: i32,           // 对齐 padding（ctrlfds 后 12 字节到下一个 8 字节边界）
+    pub(crate) libc: u64, // FridaLibcApi *
+}
+
+impl Default for FridaBootstrapContext {
+    fn default() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+/// FridaLibcApi — bootstrapper 解析出的 18 个 libc/linker 函数指针
+/// 对应 inject-context.h 中的 struct _FridaLibcApi
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FridaLibcApi {
+    pub(crate) printf: u64,
+    pub(crate) sprintf: u64,
+    pub(crate) mmap_fn: u64, // 避免与 libc::mmap 冲突
+    pub(crate) munmap_fn: u64,
+    pub(crate) socket: u64,
+    pub(crate) socketpair: u64,
+    pub(crate) connect: u64,
+    pub(crate) recvmsg: u64,
+    pub(crate) send: u64,
+    pub(crate) fcntl: u64,
+    pub(crate) close: u64,
+    pub(crate) pthread_create: u64,
+    pub(crate) pthread_detach: u64,
+    pub(crate) dlopen: u64,
+    pub(crate) dlopen_flags: i32,
+    _pad: i32,
+    pub(crate) dlclose: u64,
+    pub(crate) dlsym: u64,
+    pub(crate) dlerror: u64,
+}
+
+impl Default for FridaLibcApi {
+    fn default() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+/// RustFridaLoaderContext — loader 的输入参数
+/// 对应 rustfrida-loader.c 中的 RustFridaLoaderContext
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RustFridaLoaderContext {
+    pub(crate) ctrlfds: [i32; 2],
+    pub(crate) agent_entrypoint: u64, // const char *
+    pub(crate) agent_data: u64,       // const char *
+    pub(crate) fallback_address: u64, // const char *
+    pub(crate) libc: u64,             // FridaLibcApi *
+    pub(crate) string_table_addr: u64,
+    pub(crate) worker: u64,                // pthread_t (runtime, zeroed)
+    pub(crate) agent_handle: u64,          // void * (runtime, zeroed)
+    pub(crate) agent_entrypoint_impl: u64, // fn ptr (runtime, zeroed)
+}
+
+impl Default for RustFridaLoaderContext {
+    fn default() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
 }

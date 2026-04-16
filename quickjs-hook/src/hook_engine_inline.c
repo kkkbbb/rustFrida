@@ -103,6 +103,23 @@ void emit_replace_epilogue(Arm64Writer* w) {
     /* Restore x18 (platform register) before returning to the original caller. */
     arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X18, ARM64_REG_SP, 144);
 
+    /* Restore callee-saved registers x19-x29 from saved HookContext.
+     * Replace-mode callback (BLR) 遵循 AAPCS64 调用约定，回调内部的 Rust/C 代码
+     * 会自由使用 x19-x29 作为局部变量。如果不恢复，caller 的 callee-saved
+     * 寄存器会被破坏 → 延迟 SIGSEGV (如 GetOatQuickMethodHeader 的 caller
+     * 用 x25 做数据指针，回调破坏 x25 后 LDR [x25,#off] 崩溃)。 */
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X19, ARM64_REG_X20,
+                                             ARM64_REG_SP, 152, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X21, ARM64_REG_X22,
+                                             ARM64_REG_SP, 168, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X23, ARM64_REG_X24,
+                                             ARM64_REG_SP, 184, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X25, ARM64_REG_X26,
+                                             ARM64_REG_SP, 200, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X27, ARM64_REG_X28,
+                                             ARM64_REG_SP, 216, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X29, ARM64_REG_SP, 232);
+
     /* Restore x30 (LR — return to the caller of the hooked function) */
     arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X30, ARM64_REG_SP, 240);
 
@@ -140,11 +157,11 @@ void* generate_attach_thunk(HookEntry* entry, HookCallback on_enter,
                                     size_t* thunk_size_out) {
     void* thunk_mem;
 
-    /* Reuse thunk memory from free list entry if available and large enough */
+    /* attach thunk 需要 near: target → thunk 通过 inline patch 跳转（ADRP/B 有距离限制） */
     if (entry->thunk && entry->thunk_alloc >= THUNK_ALLOC_SIZE) {
         thunk_mem = entry->thunk;
     } else {
-        thunk_mem = hook_alloc(THUNK_ALLOC_SIZE);
+        thunk_mem = hook_alloc_near(THUNK_ALLOC_SIZE, entry->target);
         if (!thunk_mem) return NULL;
         entry->thunk = thunk_mem;
         entry->thunk_alloc = THUNK_ALLOC_SIZE;
@@ -273,11 +290,11 @@ static void* generate_replace_thunk(HookEntry* entry, HookCallback on_enter,
                                      void* user_data, size_t* thunk_size_out) {
     void* thunk_mem;
 
-    /* Reuse thunk memory from free list entry if available and large enough */
+    /* replace thunk 需要 near: target → thunk 通过 inline patch 跳转（ADRP/B 有距离限制） */
     if (entry->thunk && entry->thunk_alloc >= THUNK_ALLOC_SIZE) {
         thunk_mem = entry->thunk;
     } else {
-        thunk_mem = hook_alloc(THUNK_ALLOC_SIZE);
+        thunk_mem = hook_alloc_near(THUNK_ALLOC_SIZE, entry->target);
         if (!thunk_mem) return NULL;
         entry->thunk = thunk_mem;
         entry->thunk_alloc = THUNK_ALLOC_SIZE;
@@ -423,33 +440,62 @@ int hook_remove(void* target) {
 
     while (entry) {
         if (entry->target == target) {
-            if (entry->stealth) {
-                /* Stealth hook: release the exact patch identified by target.
-                 * This must match the addr previously passed to wxshadow PATCH.
-                 *
-                 * NOTE: stealth hooks CANNOT be removed via mprotect+memcpy —
+            if (entry->stealth == 1) {
+                /* Stealth 1 (wxshadow): release the kernel shadow mapping.
+                 * wxshadow patches CANNOT be removed via mprotect+memcpy —
                  * the shadow mapping is a kernel-level instruction-view overlay;
-                 * data-view writes do not affect it. If wxshadow_release fails,
-                 * the hook stays active. */
+                 * data-view writes do not affect it.
+                 * 跨页 patch 有两个 shadow entry (first+second segment), 需分别 release. */
                 int rc = wxshadow_release(target);
                 if (rc != 0) {
                     hook_log("hook_remove: wxshadow_release FAILED for %p (stealth hook stays active)", target);
                     pthread_mutex_unlock(&g_engine.lock);
                     return HOOK_ERROR_WXSHADOW_FAILED;
                 }
-            } else {
-                /* Normal hook: restore original bytes via mprotect + memcpy */
+                uintptr_t t = (uintptr_t)target;
+                if ((t & 0xFFF) + (uintptr_t)entry->original_size > 0x1000) {
+                    size_t first_len = 0x1000 - (t & 0xFFF);
+                    void* second_addr = (void*)(t + first_len);
+                    int rc2 = wxshadow_release(second_addr);
+                    if (rc2 != 0) {
+                        hook_log("hook_remove: stealth1 second-segment release failed at %p", second_addr);
+                        /* target 首段已释放, 首指令已恢复原字节, CPU 执行回原流程.
+                         * 第二段泄漏无害: 原指令已不会执行到 (首段直接 ret 原逻辑). */
+                    }
+                }
+            } else if (entry->stealth == 2) {
+                /* Stealth 2 (recomp): hook was installed via mprotect+write on recomp page.
+                 * Restore original bytes the same way as non-stealth hooks. */
                 uintptr_t page_start = (uintptr_t)target & ~0xFFF;
                 if (mprotect((void*)page_start, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
                     pthread_mutex_unlock(&g_engine.lock);
                     return HOOK_ERROR_MPROTECT_FAILED;
                 }
                 memcpy(target, entry->original_bytes, entry->original_size);
-                /* Restore target page from RWX to R-X after writing original bytes back */
                 restore_page_rx(page_start);
-            }
-            if (!entry->stealth) {
                 hook_flush_cache(target, entry->original_size);
+            } else {
+                /* Normal hook (stealth==0): 优先走 rw-sibling 直写（JIT cache 走这条唯一路径）。
+                 * 对装 hook 时走 rw-sibling 的目标, mprotect 本来就 EACCES, 不切这条会导致 unhook 失败,
+                 * entry 无法 free_entry (还在链表), agent 卸载后 target 的 B 指令继续跳已释放 thunk → crash. */
+                void* writable = find_rw_sibling(target, (size_t)entry->original_size);
+                if (writable) {
+                    memcpy(writable, entry->original_bytes, entry->original_size);
+                    hook_flush_cache(target, entry->original_size);
+                    hook_log("hook_remove: rw-sibling restore OK target=%p via writable=%p len=%zu",
+                             target, writable, (size_t)entry->original_size);
+                } else {
+                    uintptr_t page_start = (uintptr_t)target & ~0xFFF;
+                    if (mprotect((void*)page_start, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+                        hook_log("hook_remove: mprotect failed target=%p errno=%d, hook remains installed",
+                                 target, errno);
+                        pthread_mutex_unlock(&g_engine.lock);
+                        return HOOK_ERROR_MPROTECT_FAILED;
+                    }
+                    memcpy(target, entry->original_bytes, entry->original_size);
+                    restore_page_rx(page_start);
+                    hook_flush_cache(target, entry->original_size);
+                }
             }
 
             /* Remove from hook list */

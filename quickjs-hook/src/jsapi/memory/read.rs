@@ -1,42 +1,30 @@
 //! Memory read operations
 
-use super::helpers::get_addr_from_arg;
+use super::helpers::get_addr_this_or_arg;
 use crate::ffi;
 use crate::jsapi::ptr::create_native_pointer;
 use crate::jsapi::util::is_addr_accessible;
 use crate::value::JSValue;
 
-/// 生成标准 Memory.readXXX(ptr) 函数。
-/// 使用 `($ctx, $val) => expr` 语法传递 ctx 和读取值到转换表达式。
+/// 生成 Memory.readXXX(ptr) 和 ptr.readXXX() 双风格 read 函数。
 macro_rules! define_memory_read {
     ($name:ident, $js_name:literal, $rust_type:ty, $size:expr,
      ($ctx_id:ident, $val_id:ident) => $convert:expr) => {
         pub(super) unsafe extern "C" fn $name(
             $ctx_id: *mut ffi::JSContext,
-            _this: ffi::JSValue,
+            this: ffi::JSValue,
             argc: i32,
             argv: *mut ffi::JSValue,
         ) -> ffi::JSValue {
-            if argc < 1 {
-                return ffi::JS_ThrowTypeError(
+            let (addr, _rem_argv, _rem_argc) = match get_addr_this_or_arg($ctx_id, this, argc, argv) {
+                Some(v) => v,
+                None => return ffi::JS_ThrowTypeError(
                     $ctx_id,
-                    concat!($js_name, "() requires 1 argument\0").as_ptr() as *const _,
-                );
-            }
-            let addr = match get_addr_from_arg($ctx_id, JSValue(*argv)) {
-                Some(a) => a,
-                None => {
-                    return ffi::JS_ThrowTypeError(
-                        $ctx_id,
-                        b"Invalid pointer\0".as_ptr() as *const _,
-                    )
-                }
+                    concat!($js_name, "() requires a pointer\0").as_ptr() as *const _,
+                ),
             };
             if !is_addr_accessible(addr, $size) {
-                return ffi::JS_ThrowRangeError(
-                    $ctx_id,
-                    b"Invalid memory address\0".as_ptr() as *const _,
-                );
+                return ffi::JS_ThrowRangeError($ctx_id, b"Invalid memory address\0".as_ptr() as *const _);
             }
             let $val_id = std::ptr::read_unaligned(addr as *const $rust_type);
             $convert
@@ -55,23 +43,16 @@ define_memory_read!(memory_read_u64, "readU64", u64, 8,
 define_memory_read!(memory_read_pointer, "readPointer", u64, 8,
     (ctx, val) => create_native_pointer(ctx, val).raw());
 
-/// Memory.readCString(ptr)
+/// Memory.readCString(ptr) / ptr.readCString()
 pub(super) unsafe extern "C" fn memory_read_cstring(
     ctx: *mut ffi::JSContext,
-    _this: ffi::JSValue,
+    this: ffi::JSValue,
     argc: i32,
     argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
-    if argc < 1 {
-        return ffi::JS_ThrowTypeError(
-            ctx,
-            b"readCString() requires 1 argument\0".as_ptr() as *const _,
-        );
-    }
-
-    let addr = match get_addr_from_arg(ctx, JSValue(*argv)) {
-        Some(a) => a,
-        None => return ffi::JS_ThrowTypeError(ctx, b"Invalid pointer\0".as_ptr() as *const _),
+    let addr = match get_addr_this_or_arg(ctx, this, argc, argv) {
+        Some((a, _, _)) => a,
+        None => return ffi::JS_ThrowTypeError(ctx, b"readCString() requires a pointer\0".as_ptr() as *const _),
     };
 
     if !is_addr_accessible(addr, 1) {
@@ -109,50 +90,38 @@ pub(super) unsafe extern "C" fn memory_read_cstring(
     JSValue::string(ctx, &s).raw()
 }
 
-/// Memory.readUtf8String(ptr)
+/// Memory.readUtf8String(ptr) / ptr.readUtf8String()
 pub(super) unsafe extern "C" fn memory_read_utf8_string(
     ctx: *mut ffi::JSContext,
-    _this: ffi::JSValue,
+    this: ffi::JSValue,
     argc: i32,
     argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
     // Same as readCString for now
-    memory_read_cstring(ctx, _this, argc, argv)
+    memory_read_cstring(ctx, this, argc, argv)
 }
 
-/// Memory.readByteArray(ptr, length)
+/// Memory.readByteArray(ptr, length) / ptr.readByteArray(length)
 pub(super) unsafe extern "C" fn memory_read_byte_array(
     ctx: *mut ffi::JSContext,
-    _this: ffi::JSValue,
+    this: ffi::JSValue,
     argc: i32,
     argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
-    if argc < 2 {
-        return ffi::JS_ThrowTypeError(
-            ctx,
-            b"readByteArray() requires 2 arguments\0".as_ptr() as *const _,
-        );
+    let (addr, rem_argv, rem_argc) = match get_addr_this_or_arg(ctx, this, argc, argv) {
+        Some(v) => v,
+        None => return ffi::JS_ThrowTypeError(ctx, b"readByteArray() requires a pointer\0".as_ptr() as *const _),
+    };
+    if rem_argc < 1 {
+        return ffi::JS_ThrowTypeError(ctx, b"readByteArray() requires length argument\0".as_ptr() as *const _);
     }
 
-    let addr = match get_addr_from_arg(ctx, JSValue(*argv)) {
-        Some(a) => a,
-        None => return ffi::JS_ThrowTypeError(ctx, b"Invalid pointer\0".as_ptr() as *const _),
-    };
-
-    let length_raw = match JSValue(*argv.add(1)).to_i64(ctx) {
+    let length_raw = match JSValue(*rem_argv).to_i64(ctx) {
         Some(v) => v,
-        None => {
-            return ffi::JS_ThrowTypeError(
-                ctx,
-                b"readByteArray: length must be a number\0".as_ptr() as *const _,
-            )
-        }
+        None => return ffi::JS_ThrowTypeError(ctx, b"readByteArray: length must be a number\0".as_ptr() as *const _),
     };
     if length_raw <= 0 {
-        return ffi::JS_ThrowRangeError(
-            ctx,
-            b"readByteArray: length must be positive\0".as_ptr() as *const _,
-        );
+        return ffi::JS_ThrowRangeError(ctx, b"readByteArray: length must be positive\0".as_ptr() as *const _);
     }
     const MAX_READ_SIZE: i64 = 1024 * 1024 * 1024; // 1GB
     if length_raw > MAX_READ_SIZE {

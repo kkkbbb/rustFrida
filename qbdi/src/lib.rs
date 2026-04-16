@@ -49,21 +49,19 @@ pub mod vm;
 
 // Re-export commonly used types
 pub use callback::{
-    AnalysisType, CallbackId, ConditionType, InstAnalysis, InstPosition, MemoryAccess,
-    MemoryAccessFlags, MemoryAccessType, OperandAnalysis, OperandFlag, OperandType,
-    RegisterAccessType, VMAction, VMEvent, VMState, INVALID_EVENTID, PRIORITY_DEFAULT,
-    PRIORITY_MEMACCESS_LIMIT,
+    AnalysisType, CallbackId, ConditionType, InstAnalysis, InstPosition, MemoryAccess, MemoryAccessFlags,
+    MemoryAccessType, OperandAnalysis, OperandFlag, OperandType, RegisterAccessType, VMAction, VMEvent, VMState,
+    INVALID_EVENTID, PRIORITY_DEFAULT, PRIORITY_MEMACCESS_LIMIT,
 };
 
 pub use memory::{
-    find_module, find_module_by_addr, get_current_process_maps, get_module_executable_ranges,
-    get_module_names, get_remote_process_maps, simulate_call, AlignedAlloc, MemoryMap, Permission,
-    VirtualStack,
+    find_module, find_module_by_addr, get_current_process_maps, get_module_executable_ranges, get_module_names,
+    get_remote_process_maps, simulate_call, AlignedAlloc, MemoryMap, Permission, VirtualStack,
 };
 
 pub use state::{
-    FPRState, GPRState, LocalMonitor, RWord, SWord, AVAILABLE_GPR, GPR_NAMES, NUM_GPR, REG_BP,
-    REG_FLAG, REG_LR, REG_PC, REG_RETURN, REG_SP,
+    FPRState, GPRState, LocalMonitor, RWord, SWord, AVAILABLE_GPR, GPR_NAMES, NUM_GPR, REG_BP, REG_FLAG, REG_LR,
+    REG_PC, REG_RETURN, REG_SP,
 };
 
 pub use vm::{VMOptions, VMRef, VM};
@@ -82,9 +80,7 @@ pub fn get_version() -> (u32, &'static str) {
         if ptr.is_null() {
             QBDI_VERSION_STRING
         } else {
-            std::ffi::CStr::from_ptr(ptr)
-                .to_str()
-                .unwrap_or(QBDI_VERSION_STRING)
+            std::ffi::CStr::from_ptr(ptr).to_str().unwrap_or(QBDI_VERSION_STRING)
         }
     };
     (version, version_str)

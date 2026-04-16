@@ -5,6 +5,7 @@ pub(crate) const RAW_EVENT_MEM_ACCESS: u8 = 2;
 pub(crate) const RAW_EVENT_EXTERNAL_RETURN: u8 = 3;
 pub(crate) const RAW_EVENT_DYNAMIC_EXEC_CHUNK: u8 = 4;
 pub(crate) const RAW_EVENT_TRACE_CONTEXT: u8 = 5;
+pub(crate) const RAW_EVENT_TRACE_BUNDLE_METADATA: u8 = 6;
 
 #[derive(Clone, PartialEq, Message)]
 pub(crate) struct MemAccess {
@@ -63,8 +64,16 @@ pub(crate) struct TraceContext {
 }
 
 #[derive(Clone, PartialEq, Message)]
+pub(crate) struct TraceBundleMetadata {
+    #[prost(string, tag = "1")]
+    pub(crate) module_path: String,
+    #[prost(uint64, tag = "2")]
+    pub(crate) module_base: u64,
+}
+
+#[derive(Clone, PartialEq, Message)]
 pub(crate) struct TraceBundleEvent {
-    #[prost(oneof = "TraceBundleEventKind", tags = "1, 2, 3, 4, 5")]
+    #[prost(oneof = "TraceBundleEventKind", tags = "1, 2, 3, 4, 5, 6")]
     pub(crate) kind: Option<TraceBundleEventKind>,
 }
 
@@ -80,6 +89,8 @@ pub(crate) enum TraceBundleEventKind {
     DynamicExecChunk(DynamicExecChunk),
     #[prost(message, tag = "5")]
     TraceContext(TraceContext),
+    #[prost(message, tag = "6")]
+    TraceBundleMetadata(TraceBundleMetadata),
 }
 
 fn put_u32(buf: &mut Vec<u8>, value: u32) {
@@ -126,6 +137,7 @@ pub(crate) fn raw_event_size(event: &TraceBundleEvent) -> usize {
             1 + 8 + 8 + 4 + 8 + 4 + 4 + chunk.path.len() + chunk.data.len()
         }
         TraceBundleEventKind::TraceContext(_) => 1 + (31 + 4 + 64 + 2) * 8,
+        TraceBundleEventKind::TraceBundleMetadata(meta) => 1 + 4 + meta.module_path.len() + 8,
     }
 }
 
@@ -172,6 +184,12 @@ pub(crate) fn encode_raw_event_into(buf: &mut Vec<u8>, event: &TraceBundleEvent)
             }
             put_u64(buf, ctx.fpcr);
             put_u64(buf, ctx.fpsr);
+        }
+        TraceBundleEventKind::TraceBundleMetadata(meta) => {
+            buf.push(RAW_EVENT_TRACE_BUNDLE_METADATA);
+            put_u32(buf, meta.module_path.len() as u32);
+            buf.extend_from_slice(meta.module_path.as_bytes());
+            put_u64(buf, meta.module_base);
         }
     }
 }
@@ -245,6 +263,18 @@ pub(crate) fn transcode_raw_chunk(raw: &[u8]) -> Result<Vec<u8>, String> {
                     fpsr: read_u64(&mut cursor, raw)?,
                 })),
             },
+            RAW_EVENT_TRACE_BUNDLE_METADATA => {
+                let path_len = read_u32(&mut cursor, raw)? as usize;
+                let module_path = String::from_utf8(read_bytes(&mut cursor, raw, path_len)?)
+                    .map_err(|_| "raw metadata path is not utf-8".to_string())?;
+                let module_base = read_u64(&mut cursor, raw)?;
+                TraceBundleEvent {
+                    kind: Some(TraceBundleEventKind::TraceBundleMetadata(TraceBundleMetadata {
+                        module_path,
+                        module_base,
+                    })),
+                }
+            }
             other => return Err(format!("unknown raw event tag {}", other)),
         };
         event

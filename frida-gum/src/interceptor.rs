@@ -29,9 +29,7 @@ pub struct Interceptor {
 impl Clone for Interceptor {
     fn clone(&self) -> Self {
         Interceptor {
-            interceptor: unsafe {
-                frida_gum_sys::g_object_ref(self.interceptor as *mut _) as *mut _
-            },
+            interceptor: unsafe { frida_gum_sys::g_object_ref(self.interceptor as *mut _) as *mut _ },
             _gum: self._gum.clone(),
         }
     }
@@ -62,24 +60,12 @@ impl Interceptor {
     /// memory region.
     #[cfg(feature = "invocation-listener")]
     #[cfg_attr(docsrs, doc(cfg(feature = "invocation-listener")))]
-    pub fn attach<I: InvocationListener>(
-        &mut self,
-        f: NativePointer,
-        listener: &mut I,
-    ) -> Result<Listener> {
+    pub fn attach<I: InvocationListener>(&mut self, f: NativePointer, listener: &mut I) -> Result<Listener> {
         let listener = invocation_listener_transform(listener);
-        match unsafe {
-            gum_sys::gum_interceptor_attach(self.interceptor, f.0, listener, ptr::null_mut(), 0)
-        } {
-            gum_sys::GumAttachReturn_GUM_ATTACH_OK => {
-                Ok(Listener(NativePointer(listener as *mut c_void)))
-            }
-            gum_sys::GumAttachReturn_GUM_ATTACH_WRONG_SIGNATURE => {
-                Err(Error::InterceptorBadSignature)
-            }
-            gum_sys::GumAttachReturn_GUM_ATTACH_ALREADY_ATTACHED => {
-                Err(Error::InterceptorAlreadyAttached)
-            }
+        match unsafe { gum_sys::gum_interceptor_attach(self.interceptor, f.0, listener, ptr::null_mut(), 0) } {
+            gum_sys::GumAttachReturn_GUM_ATTACH_OK => Ok(Listener(NativePointer(listener as *mut c_void))),
+            gum_sys::GumAttachReturn_GUM_ATTACH_WRONG_SIGNATURE => Err(Error::InterceptorBadSignature),
+            gum_sys::GumAttachReturn_GUM_ATTACH_ALREADY_ATTACHED => Err(Error::InterceptorAlreadyAttached),
             gum_sys::GumAttachReturn_GUM_ATTACH_POLICY_VIOLATION => Err(Error::PolicyViolation),
             gum_sys::GumAttachReturn_GUM_ATTACH_WRONG_TYPE => Err(Error::WrongType),
             _ => Err(Error::InterceptorError),
@@ -93,24 +79,12 @@ impl Interceptor {
     /// The provided address *must* point to a valid instruction.
     #[cfg(feature = "invocation-listener")]
     #[cfg_attr(docsrs, doc(cfg(feature = "invocation-listener")))]
-    pub fn attach_instruction<I: ProbeListener>(
-        &mut self,
-        instr: NativePointer,
-        listener: &mut I,
-    ) -> Result<Listener> {
+    pub fn attach_instruction<I: ProbeListener>(&mut self, instr: NativePointer, listener: &mut I) -> Result<Listener> {
         let listener = probe_listener_transform(listener);
-        match unsafe {
-            gum_sys::gum_interceptor_attach(self.interceptor, instr.0, listener, ptr::null_mut(), 0)
-        } {
-            gum_sys::GumAttachReturn_GUM_ATTACH_OK => {
-                Ok(Listener(NativePointer(listener as *mut c_void)))
-            }
-            gum_sys::GumAttachReturn_GUM_ATTACH_WRONG_SIGNATURE => {
-                Err(Error::InterceptorBadSignature)
-            }
-            gum_sys::GumAttachReturn_GUM_ATTACH_ALREADY_ATTACHED => {
-                Err(Error::InterceptorAlreadyAttached)
-            }
+        match unsafe { gum_sys::gum_interceptor_attach(self.interceptor, instr.0, listener, ptr::null_mut(), 0) } {
+            gum_sys::GumAttachReturn_GUM_ATTACH_OK => Ok(Listener(NativePointer(listener as *mut c_void))),
+            gum_sys::GumAttachReturn_GUM_ATTACH_WRONG_SIGNATURE => Err(Error::InterceptorBadSignature),
+            gum_sys::GumAttachReturn_GUM_ATTACH_ALREADY_ATTACHED => Err(Error::InterceptorAlreadyAttached),
             gum_sys::GumAttachReturn_GUM_ATTACH_POLICY_VIOLATION => Err(Error::PolicyViolation),
             gum_sys::GumAttachReturn_GUM_ATTACH_WRONG_TYPE => Err(Error::WrongType),
             _ => Err(Error::InterceptorError),
@@ -126,12 +100,7 @@ impl Interceptor {
     #[cfg_attr(docsrs, doc(cfg(feature = "invocation-listener")))]
     pub fn detach(&mut self, listener: Listener) {
         let Listener(NativePointer(ptr)) = listener;
-        unsafe {
-            gum_sys::gum_interceptor_detach(
-                self.interceptor,
-                ptr as *mut gum_sys::GumInvocationListener,
-            )
-        };
+        unsafe { gum_sys::gum_interceptor_detach(self.interceptor, ptr as *mut gum_sys::GumInvocationListener) };
     }
 
     /// Replace a function with another function. The new function should have the same signature
@@ -157,15 +126,9 @@ impl Interceptor {
                 &mut original_function.0,
             ) {
                 gum_sys::GumReplaceReturn_GUM_REPLACE_OK => Ok(original_function),
-                gum_sys::GumReplaceReturn_GUM_REPLACE_WRONG_SIGNATURE => {
-                    Err(Error::InterceptorBadSignature)
-                }
-                gum_sys::GumReplaceReturn_GUM_REPLACE_ALREADY_REPLACED => {
-                    Err(Error::InterceptorAlreadyReplaced)
-                }
-                gum_sys::GumReplaceReturn_GUM_REPLACE_POLICY_VIOLATION => {
-                    Err(Error::PolicyViolation)
-                }
+                gum_sys::GumReplaceReturn_GUM_REPLACE_WRONG_SIGNATURE => Err(Error::InterceptorBadSignature),
+                gum_sys::GumReplaceReturn_GUM_REPLACE_ALREADY_REPLACED => Err(Error::InterceptorAlreadyReplaced),
+                gum_sys::GumReplaceReturn_GUM_REPLACE_POLICY_VIOLATION => Err(Error::PolicyViolation),
                 gum_sys::GumReplaceReturn_GUM_REPLACE_WRONG_TYPE => Err(Error::WrongType),
                 _ => Err(Error::InterceptorError),
             }
@@ -183,11 +146,7 @@ impl Interceptor {
     ///
     /// Assumes that the provided function and replacement addresses are valid and point to the
     /// start of valid functions
-    pub fn replace_fast(
-        &mut self,
-        function: NativePointer,
-        replacement: NativePointer,
-    ) -> Result<NativePointer> {
+    pub fn replace_fast(&mut self, function: NativePointer, replacement: NativePointer) -> Result<NativePointer> {
         let mut original_function = NativePointer(ptr::null_mut());
         unsafe {
             match gum_sys::gum_interceptor_replace_fast(
@@ -197,15 +156,9 @@ impl Interceptor {
                 &mut original_function.0,
             ) {
                 gum_sys::GumReplaceReturn_GUM_REPLACE_OK => Ok(original_function),
-                gum_sys::GumReplaceReturn_GUM_REPLACE_WRONG_SIGNATURE => {
-                    Err(Error::InterceptorBadSignature)
-                }
-                gum_sys::GumReplaceReturn_GUM_REPLACE_ALREADY_REPLACED => {
-                    Err(Error::InterceptorAlreadyReplaced)
-                }
-                gum_sys::GumReplaceReturn_GUM_REPLACE_POLICY_VIOLATION => {
-                    Err(Error::PolicyViolation)
-                }
+                gum_sys::GumReplaceReturn_GUM_REPLACE_WRONG_SIGNATURE => Err(Error::InterceptorBadSignature),
+                gum_sys::GumReplaceReturn_GUM_REPLACE_ALREADY_REPLACED => Err(Error::InterceptorAlreadyReplaced),
+                gum_sys::GumReplaceReturn_GUM_REPLACE_POLICY_VIOLATION => Err(Error::PolicyViolation),
                 gum_sys::GumReplaceReturn_GUM_REPLACE_WRONG_TYPE => Err(Error::WrongType),
                 _ => Err(Error::InterceptorError),
             }

@@ -52,10 +52,7 @@ fn main() {
         println!("cargo:rerun-if-changed=stalker_params.h");
     }
 
-    println!(
-        "cargo:rustc-link-search={}",
-        env::var("CARGO_MANIFEST_DIR").unwrap()
-    );
+    println!("cargo:rustc-link-search={}", env::var("CARGO_MANIFEST_DIR").unwrap());
 
     #[cfg(feature = "auto-download")]
     let include_dir = {
@@ -119,9 +116,7 @@ fn main() {
         .unwrap();
 
     let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
-    bindings
-        .write_to_file(out_path.join("bindings.rs"))
-        .unwrap();
+    bindings.write_to_file(out_path.join("bindings.rs")).unwrap();
 
     #[cfg(feature = "event-sink")]
     {
@@ -132,11 +127,7 @@ fn main() {
         let mut builder = builder.include(include_dir.clone());
 
         #[cfg(not(feature = "auto-download"))]
-        let builder = if docs {
-            builder.include("include")
-        } else {
-            &mut builder
-        };
+        let builder = if docs { builder.include("include") } else { &mut builder };
 
         builder
             .file("event_sink.c")
@@ -154,11 +145,7 @@ fn main() {
         let mut builder = builder.include(include_dir.clone());
 
         #[cfg(not(feature = "auto-download"))]
-        let builder = if docs {
-            builder.include("include")
-        } else {
-            &mut builder
-        };
+        let builder = if docs { builder.include("include") } else { &mut builder };
 
         builder
             .file("invocation_listener.c")
@@ -173,11 +160,7 @@ fn main() {
         let mut builder = builder.include(include_dir.clone());
 
         #[cfg(not(feature = "auto-download"))]
-        let builder = if docs {
-            builder.include("include")
-        } else {
-            &mut builder
-        };
+        let builder = if docs { builder.include("include") } else { &mut builder };
         builder
             .file("probe_listener.c")
             .opt_level(3)
@@ -194,11 +177,7 @@ fn main() {
         let mut builder = builder.include(include_dir.clone());
 
         #[cfg(not(feature = "auto-download"))]
-        let builder = if docs {
-            builder.include("include")
-        } else {
-            &mut builder
-        };
+        let builder = if docs { builder.include("include") } else { &mut builder };
 
         builder
             .file("stalker_observer.c")
@@ -216,11 +195,7 @@ fn main() {
         let mut builder = builder.include(include_dir);
 
         #[cfg(not(feature = "auto-download"))]
-        let builder = if docs {
-            builder.include("include")
-        } else {
-            &mut builder
-        };
+        let builder = if docs { builder.include("include") } else { &mut builder };
 
         builder
             .file("stalker_params.c")
@@ -231,8 +206,8 @@ fn main() {
 
     if target_os == "windows" {
         for lib in [
-            "dnsapi", "iphlpapi", "psapi", "winmm", "ws2_32", "advapi32", "crypt32", "gdi32",
-            "kernel32", "ole32", "secur32", "shell32", "shlwapi", "user32", "setupapi",
+            "dnsapi", "iphlpapi", "psapi", "winmm", "ws2_32", "advapi32", "crypt32", "gdi32", "kernel32", "ole32",
+            "secur32", "shell32", "shlwapi", "user32", "setupapi",
         ] {
             println!("cargo:rustc-link-lib=dylib={lib}");
         }

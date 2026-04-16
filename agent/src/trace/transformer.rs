@@ -7,8 +7,7 @@ use crate::communication::write_stream;
 use crate::exec_mem::ExecMem;
 use crate::gumlibc::gum_libc_ptrace;
 use libc::{
-    c_int, mmap, pid_t, CLONE_SETTLS, CLONE_VM, MAP_ANONYMOUS, MAP_PRIVATE, PROT_READ, PROT_WRITE,
-    PTRACE_DETACH,
+    c_int, mmap, pid_t, CLONE_SETTLS, CLONE_VM, MAP_ANONYMOUS, MAP_PRIVATE, PROT_READ, PROT_WRITE, PTRACE_DETACH,
 };
 use once_cell::unsync::Lazy;
 use std::ptr::null_mut;
@@ -67,10 +66,7 @@ pub fn transformer_global(addr: usize) -> Result<usize> {
         INSTRUCT_PTR = addr as *const u32;
         let closure_result = {
             while !is_arm64_branch(*INSTRUCT_PTR) {
-                arm64_relocator::relocate_one_a64(
-                    INSTRUCT_PTR as usize,
-                    exe_mem.external_write_instruct(),
-                );
+                arm64_relocator::relocate_one_a64(INSTRUCT_PTR as usize, exe_mem.external_write_instruct());
                 INSTRUCT_PTR = INSTRUCT_PTR.add(1);
             }
             Ok(())
@@ -94,7 +90,7 @@ pub fn transformer_global(addr: usize) -> Result<usize> {
 // ============== Trace 入口 ==============
 
 pub fn gum_modify_thread(thread_id: usize) -> Result<pid_t> {
-    let stack = unsafe {
+    let stack_base = unsafe {
         mmap(
             null_mut(),
             0x1100000,
@@ -103,8 +99,9 @@ pub fn gum_modify_thread(thread_id: usize) -> Result<pid_t> {
             -1,
             0,
         )
-        .add(0x1100000)
     };
+    let _ = crate::vma_name::set_anon_vma_name_raw(stack_base as *mut u8, 0x1100000, b"wwb_trace_stack\0");
+    let stack = unsafe { stack_base.add(0x1100000) };
     let tls = unsafe {
         mmap(
             null_mut(),
@@ -115,6 +112,7 @@ pub fn gum_modify_thread(thread_id: usize) -> Result<pid_t> {
             0,
         )
     };
+    let _ = crate::vma_name::set_anon_vma_name_raw(tls as *mut u8, 0x1000, b"wwb_trace_tls\0");
     crate::gumlibc::gum_libc_clone(
         tracer as *mut usize,
         thread_id,
@@ -144,19 +142,14 @@ extern "C" fn tracer(thread_id: i32) -> c_int {
         write_stream(("\nget pc: ".to_string() + &(INSTRUCT_PTR as usize).to_string()).as_bytes());
 
         while !is_arm64_branch(*INSTRUCT_PTR) {
-            arm64_relocator::relocate_one_a64(
-                INSTRUCT_PTR as usize,
-                exe_mem.external_write_instruct(),
-            );
+            arm64_relocator::relocate_one_a64(INSTRUCT_PTR as usize, exe_mem.external_write_instruct());
             INSTRUCT_PTR = INSTRUCT_PTR.add(1);
         }
 
         for instruct in gen_jump_to_transformer() {
             exe_mem.write_u32(instruct).unwrap();
         }
-        write_stream(
-            ("\ntrace compile finished :".to_string() + &(regs.pc as u64).to_string()).as_bytes(),
-        );
+        write_stream(("\ntrace compile finished :".to_string() + &(regs.pc as u64).to_string()).as_bytes());
         regs.pc = exe_mem.ptr as usize;
         set_reg(thread_id, &mut regs).unwrap();
 

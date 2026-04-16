@@ -6,12 +6,37 @@ use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;
 use rustyline::validate::Validator;
 use rustyline::{CompletionType, Config, Context, Editor, Helper};
-use std::sync::mpsc::Sender;
+use std::sync::Arc;
 use std::sync::OnceLock;
 
-use crate::communication::{complete_state, eval_state, send_command, HostToAgentMessage};
+use crate::communication::send_command;
 use crate::log_error;
 use crate::logger::{GRAY, GREEN, HIGHLIGHT_BG, HIGHLIGHT_FG, RED, RESET, YELLOW};
+use crate::session::Session;
+
+/// 构造一个带可选 filename 前缀的 `loadjs` 命令字符串。
+///
+/// 当 `script_path` 非空时会提取 basename 作为 QuickJS 的 source filename，
+/// 错误信息会显示 `script.js:line:col` 而不是 `<eval>:line:col`。
+///
+/// 脚本本身保留原始换行，不做任何 `\n → \r` 替换（wire 协议是长度前缀的二进制帧，
+/// 支持任意字节）。
+pub(crate) fn build_loadjs_cmd(script: &str, script_path: Option<&str>) -> String {
+    if let Some(path) = script_path {
+        let name = std::path::Path::new(path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("script.js");
+        // filename 内含 `[` / `]` / `\n` 会破坏解析，fallback 到 <eval>
+        if name.contains('[') || name.contains(']') || name.contains('\n') {
+            format!("loadjs {}", script)
+        } else {
+            format!("loadjs [{}]\n{}", name, script)
+        }
+    } else {
+        format!("loadjs {}", script)
+    }
+}
 
 /// 当前构建实际可用的命令列表（编译时由 feature 控制）
 pub(crate) fn commands() -> &'static [(&'static str, &'static str, &'static str)] {
@@ -32,19 +57,11 @@ pub(crate) fn commands() -> &'static [(&'static str, &'static str, &'static str)
         #[cfg(feature = "frida-gum")]
         {
             v.push(("stalker", "[tid]", "Frida Stalker 追踪 [frida-gum ✓]"));
-            v.push((
-                "hfl",
-                "<module> <offset>",
-                "Interceptor hook 指定偏移 [frida-gum ✓]",
-            ));
+            v.push(("hfl", "<module> <offset>", "Interceptor hook 指定偏移 [frida-gum ✓]"));
         }
         #[cfg(not(feature = "frida-gum"))]
         {
-            v.push((
-                "stalker",
-                "[tid]",
-                "Frida Stalker 追踪 [--features frida-gum 启用]",
-            ));
+            v.push(("stalker", "[tid]", "Frida Stalker 追踪 [--features frida-gum 启用]"));
             v.push((
                 "hfl",
                 "<module> <offset>",
@@ -67,12 +84,7 @@ impl CommandCompleter {
 impl Completer for CommandCompleter {
     type Candidate = Pair;
 
-    fn complete(
-        &self,
-        line: &str,
-        pos: usize,
-        _ctx: &Context<'_>,
-    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+    fn complete(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> rustyline::Result<(usize, Vec<Pair>)> {
         // 只在光标处于第一个 token 范围内时补全
         let before_cursor = &line[..pos];
         if before_cursor.contains(' ') {
@@ -100,15 +112,15 @@ impl Helper for CommandCompleter {}
 
 /// JS REPL 补全器：通过 socket 向 agent 发送 jscomplete 请求，同步等待结果。
 struct JsReplCompleter {
-    sender: Sender<HostToAgentMessage>,
+    session: Arc<Session>,
     /// Cache the last completion results for the hinter to display
     last_candidates: std::cell::RefCell<(String, Vec<String>)>,
 }
 
 impl JsReplCompleter {
-    fn new(sender: Sender<HostToAgentMessage>) -> Self {
+    fn new(session: Arc<Session>) -> Self {
         JsReplCompleter {
-            sender,
+            session,
             last_candidates: std::cell::RefCell::new((String::new(), vec![])),
         }
     }
@@ -117,9 +129,13 @@ impl JsReplCompleter {
     fn fetch_completions(&self, prefix: &str) -> Vec<String> {
         let timeout = std::time::Duration::from_millis(300);
         let cmd = format!("jscomplete {}", prefix);
-        let sender = self.sender.clone();
+        let sender = match self.session.get_sender() {
+            Some(s) => s.clone(),
+            None => return vec![],
+        };
         // 持锁 clear + 发命令 + wait，原子消除竞态窗口
-        complete_state()
+        self.session
+            .complete_state
             .clear_then_recv(timeout, || {
                 let _ = send_command(&sender, cmd);
             })
@@ -130,12 +146,7 @@ impl JsReplCompleter {
 impl Completer for JsReplCompleter {
     type Candidate = Pair;
 
-    fn complete(
-        &self,
-        line: &str,
-        pos: usize,
-        _ctx: &Context<'_>,
-    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+    fn complete(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> rustyline::Result<(usize, Vec<Pair>)> {
         let before_cursor = &line[..pos];
 
         // Determine the replacement start position.  After the last '.' we only
@@ -179,9 +190,7 @@ impl Hinter for JsReplCompleter {
         }
 
         // Check if current input matches the cached prefix context
-        if !cached_prefix.starts_with(before_cursor)
-            && !before_cursor.starts_with(cached_prefix.as_str())
-        {
+        if !cached_prefix.starts_with(before_cursor) && !before_cursor.starts_with(cached_prefix.as_str()) {
             return None;
         }
 
@@ -203,11 +212,7 @@ impl Hinter for JsReplCompleter {
         }
 
         // Build hint: show as " [debug|error|info|log|warn]"
-        let hint_list = matching
-            .iter()
-            .map(|s| s.as_str())
-            .collect::<Vec<_>>()
-            .join("|");
+        let hint_list = matching.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("|");
         Some(format!(" [{}]", hint_list))
     }
 }
@@ -215,11 +220,7 @@ impl Highlighter for JsReplCompleter {
     fn highlight_hint<'h>(&self, hint: &'h str) -> std::borrow::Cow<'h, str> {
         std::borrow::Cow::Owned(format!("{GRAY}{hint}{RESET}"))
     }
-    fn highlight_candidate<'c>(
-        &self,
-        candidate: &'c str,
-        completion: CompletionType,
-    ) -> std::borrow::Cow<'c, str> {
+    fn highlight_candidate<'c>(&self, candidate: &'c str, completion: CompletionType) -> std::borrow::Cow<'c, str> {
         if completion == CompletionType::List {
             std::borrow::Cow::Owned(format!("{HIGHLIGHT_BG}{HIGHLIGHT_FG}{candidate}{RESET}"))
         } else {
@@ -230,10 +231,12 @@ impl Highlighter for JsReplCompleter {
 impl Validator for JsReplCompleter {}
 impl Helper for JsReplCompleter {}
 
-/// 打印 eval 响应：等待 eval_state 结果并格式化输出。
-/// main.rs REPL 循环和 jsrepl 模式共用此逻辑。
-pub(crate) fn print_eval_result(timeout_secs: u64) {
-    match eval_state().recv_timeout(std::time::Duration::from_secs(timeout_secs)) {
+/// 打印 eval 响应：等待 session.eval_state 结果并格式化输出。
+pub(crate) fn print_eval_result(session: &Session, timeout_secs: u64) {
+    match session
+        .eval_state
+        .recv_timeout(std::time::Duration::from_secs(timeout_secs))
+    {
         None => println!("{YELLOW}[timeout] 等待执行结果超时{RESET}"),
         Some(Ok(output)) => {
             if !output.is_empty() {
@@ -251,10 +254,7 @@ pub(crate) fn print_help() {
     println!("{DIM}  {:<10} {:<22} {}{RESET}", "命令", "参数", "说明");
     println!("{DIM}  {:-<10} {:-<22} {:-<20}{RESET}", "", "", "");
     for (cmd, args, desc) in commands() {
-        println!(
-            "  {BOLD}{GREEN}{:<10}{RESET} {YELLOW}{:<22}{RESET} {}",
-            cmd, args, desc
-        );
+        println!("  {BOLD}{GREEN}{:<10}{RESET} {YELLOW}{:<22}{RESET} {}", cmd, args, desc);
     }
     println!();
     println!("{BOLD}{CYAN}JavaScript API（在 loadjs/jseval/jsrepl 中可用）:{RESET}");
@@ -281,14 +281,10 @@ pub(crate) fn print_help() {
     println!("{DIM}             {RESET}  .method.impl = null → unhook");
     println!("{DIM}  Jni{RESET}          .FindClass/.RegisterNatives ... → JNI 函数地址");
     println!("{DIM}             {RESET}  .addr(env, \"FindClass\") / .addr(\"FindClass\")");
-    println!(
-        "{DIM}             {RESET}  .find(env, \"FindClass\") / .entries(env) / .table.FindClass"
-    );
+    println!("{DIM}             {RESET}  .find(env, \"FindClass\") / .entries(env) / .table.FindClass");
     println!("{DIM}             {RESET}  .helper.env.getObjectClassName(obj)");
     println!("{DIM}             {RESET}  .helper.structs.JNINativeMethod.readArray(ptr, n)");
-    println!(
-        "{DIM}             {RESET}  .helper.structs.jvalue.readArray(ptr, \"(ILjava/lang/String;)V\")"
-    );
+    println!("{DIM}             {RESET}  .helper.structs.jvalue.readArray(ptr, \"(ILjava/lang/String;)V\")");
     println!("{DIM}  示例:{RESET}");
     println!("{DIM}    jseval Memory.readCString(ptr(0x7f000000)){RESET}");
     println!("{DIM}    jseval JSON.stringify(Module.findByAddress(ptr(0x7f000000))){RESET}");
@@ -297,10 +293,10 @@ pub(crate) fn print_help() {
     println!("{DIM}    loadjs hook(Jni.addr(\"FindClass\"), function(ctx){{console.log(Memory.readCString(ptr(ctx.x1))); return ctx.orig()}}){RESET}");
     println!("{DIM}    loadjs hook(Jni.addr(\"RegisterNatives\"), function(ctx){{console.log(JSON.stringify(Jni.helper.structs.JNINativeMethod.readArray(ptr(ctx.x2), Number(ctx.x3)))); return ctx.orig()}}){RESET}");
     println!("{DIM}    loadjs hook(Jni.addr(\"GetMethodID\"), function(ctx){{console.log(Jni.helper.env.getClassName(ctx.x1), Memory.readCString(ptr(ctx.x2)), Memory.readCString(ptr(ctx.x3))); return ctx.orig()}}){RESET}");
+    println!("{DIM}    loadjs var P=Java.use(\"android.os.Process\"); console.log(P.myPid()){RESET}");
     println!(
-        "{DIM}    loadjs var P=Java.use(\"android.os.Process\"); console.log(P.myPid()){RESET}"
+        "{DIM}    loadjs var S=Java.use(\"java.lang.String\"); var s=S.$new(\"hello\"); console.log(s.length()){RESET}"
     );
-    println!("{DIM}    loadjs var S=Java.use(\"java.lang.String\"); var s=S.$new(\"hello\"); console.log(s.length()){RESET}");
     println!();
 }
 
@@ -309,13 +305,21 @@ pub(crate) fn print_help() {
 /// Every line is sent as `loadjs <line>` to the agent.  Tab completion
 /// queries the live QuickJS global scope via `jscomplete`.
 /// Type `exit` or press Ctrl-D / Ctrl-C to return to the main prompt.
-pub(crate) fn run_js_repl(sender: &Sender<HostToAgentMessage>) {
+pub(crate) fn run_js_repl(session: &Arc<Session>) {
     use crate::logger::{BOLD, CYAN, DIM, RESET};
+
+    let sender = match session.get_sender() {
+        Some(s) => s,
+        None => {
+            log_error!("jsrepl: agent 未连接");
+            return;
+        }
+    };
 
     // Auto-initialize JS engine: send jsinit and wait for EVAL confirmation.
     // Accept both Ok (just initialized) and Err containing "已初始化" (already was ready).
     {
-        let result = eval_state().clear_then_recv(std::time::Duration::from_secs(5), || {
+        let result = session.eval_state.clear_then_recv(std::time::Duration::from_secs(5), || {
             let _ = send_command(sender, "jsinit");
         });
         match result {
@@ -334,11 +338,7 @@ pub(crate) fn run_js_repl(sender: &Sender<HostToAgentMessage>) {
 
     println!("\n{BOLD}{CYAN}进入 JS REPL 模式{RESET} {DIM}(输入 exit 或按 Ctrl-D 退出){RESET}\n");
 
-    // Clone the sender so JsReplCompleter can own it
-    let sender_clone = sender.clone();
-    let config = Config::builder()
-        .completion_type(CompletionType::Circular)
-        .build();
+    let config = Config::builder().completion_type(CompletionType::Circular).build();
     let mut rl: Editor<JsReplCompleter, _> = match Editor::with_config(config) {
         Ok(e) => e,
         Err(e) => {
@@ -346,7 +346,7 @@ pub(crate) fn run_js_repl(sender: &Sender<HostToAgentMessage>) {
             return;
         }
     };
-    rl.set_helper(Some(JsReplCompleter::new(sender_clone)));
+    rl.set_helper(Some(JsReplCompleter::new(session.clone())));
     let _ = rl.load_history(".rustfrida_js_history");
 
     loop {
@@ -362,14 +362,14 @@ pub(crate) fn run_js_repl(sender: &Sender<HostToAgentMessage>) {
                     break;
                 }
                 // 发送前清空 eval 状态
-                eval_state().clear();
+                session.eval_state.clear();
                 let cmd = format!("loadjs {}", line);
                 if let Err(e) = send_command(sender, cmd) {
                     log_error!("发送 JS 命令失败: {}", e);
                     break;
                 }
                 // 同步等待 agent 返回结果（最长 5 秒）
-                print_eval_result(5);
+                print_eval_result(session, 5);
             }
             Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
                 println!("{DIM}退出 JS REPL 模式{RESET}");

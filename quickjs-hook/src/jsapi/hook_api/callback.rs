@@ -6,8 +6,7 @@
 use crate::ffi;
 use crate::ffi::hook as hook_ffi;
 use crate::jsapi::callback_util::{
-    get_js_u64_property, invoke_hook_callback_common, js_u64_to_js_number_or_bigint,
-    js_value_to_u64_or_zero,
+    get_js_u64_property, invoke_hook_callback_common, js_u64_to_js_number_or_bigint, js_value_to_u64_or_zero,
     set_js_cfunction_property, set_js_u64_property,
 };
 use std::sync::{Condvar, Mutex};
@@ -70,10 +69,7 @@ fn pop_native_hook_frame(ctx_ptr: *mut hook_ffi::HookContext, trampoline: u64) -
     }
 }
 
-fn mark_native_hook_frame_orig_called(
-    ctx_ptr: *mut hook_ffi::HookContext,
-    trampoline: u64,
-) -> bool {
+fn mark_native_hook_frame_orig_called(ctx_ptr: *mut hook_ffi::HookContext, trampoline: u64) -> bool {
     let mut stack = NATIVE_HOOK_STACK.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(frame) = stack
         .iter_mut()
@@ -88,10 +84,12 @@ fn mark_native_hook_frame_orig_called(
 
 fn current_native_hook_frame() -> Option<(*mut hook_ffi::HookContext, u64)> {
     let stack = NATIVE_HOOK_STACK.lock().unwrap_or_else(|e| e.into_inner());
-    stack.last().map(|frame| (frame.ctx_ptr as *mut hook_ffi::HookContext, frame.trampoline))
+    stack
+        .last()
+        .map(|frame| (frame.ctx_ptr as *mut hook_ffi::HookContext, frame.trampoline))
 }
 
-pub(super) fn wait_for_in_flight_native_hook_callbacks(timeout: std::time::Duration) -> bool {
+pub(crate) fn wait_for_in_flight_native_hook_callbacks(timeout: std::time::Duration) -> bool {
     let start = std::time::Instant::now();
     let mut in_flight = IN_FLIGHT_NATIVE_HOOK_CALLBACKS
         .lock()
@@ -143,11 +141,7 @@ pub(crate) unsafe extern "C" fn hook_callback_wrapper(
             Some(d) => d,
             None => return,
         };
-        (
-            hook_data.ctx,
-            hook_data.callback_bytes,
-            hook_data.trampoline,
-        )
+        (hook_data.ctx, hook_data.callback_bytes, hook_data.trampoline)
     }; // HOOK_REGISTRY lock released here
 
     push_native_hook_frame(ctx_ptr, trampoline);
@@ -180,15 +174,26 @@ pub(crate) unsafe extern "C" fn hook_callback_wrapper(
 
             js_ctx
         },
-        // 处理返回值：从上下文对象读回 x0（replace mode 只恢复 x0）
+        // 处理返回值：
+        // 1. 先同步 JS ctx 上所有被修改的寄存器到 C HookContext
+        // 2. 显式 return 值 → 覆盖 x0
+        // 3. 不 return（undefined）→ 保持 ctx.x0 的值（可能被 JS 修改或被 orig() 写入）
         |ctx, js_ctx, result| {
             result_was_set = true;
-            let result_val = ffi::JSValue { u: result.u, tag: result.tag };
+            // 同步 JS ctx 属性 → C HookContext（用户可能修改了 ctx.x0 等）
+            for i in 0..31u32 {
+                let prop_name = format!("x{}", i);
+                (*ctx_ptr).x[i as usize] = get_js_u64_property(ctx, js_ctx, &prop_name);
+            }
+            // 显式 return 值覆盖 x0
+            let result_val = ffi::JSValue {
+                u: result.u,
+                tag: result.tag,
+            };
             if ffi::qjs_is_undefined(result_val) == 0 {
                 (*ctx_ptr).x[0] = js_value_to_u64_or_zero(ctx, crate::value::JSValue(result_val));
-            } else {
-                (*ctx_ptr).x[0] = get_js_u64_property(ctx, js_ctx, "x0");
             }
+            // undefined 时保持 ctx.x0 (可能是 orig() 写入的返回值或 JS 修改的值)
         },
     );
 
@@ -197,19 +202,21 @@ pub(crate) unsafe extern "C" fn hook_callback_wrapper(
     // Fallback: if the JS callback was skipped (engine busy) or threw an exception,
     // treat the hook as transparent and invoke the original function.
     if !result_was_set && trampoline != 0 && !orig_called {
-        (*ctx_ptr).x[0] =
-            hook_ffi::hook_invoke_trampoline(ctx_ptr, trampoline as *mut std::ffi::c_void);
+        (*ctx_ptr).x[0] = hook_ffi::hook_invoke_trampoline(ctx_ptr, trampoline as *mut std::ffi::c_void);
     }
 }
 
-/// JS CFunction: ctx.orig()
-/// Restores registers from HookContext and calls the trampoline (original function).
-/// Returns the result as BigUint64, also writes it to ctx.x[0].
+/// JS CFunction: ctx.orig(...args?)
+///
+/// 无参数: 先同步 JS ctx 对象上被修改的寄存器到 C HookContext，再调用 trampoline。
+/// 有参数: 用传入的参数覆盖 x0-xN（最多 6 个），其余寄存器同步自 JS ctx。
+///
+/// 返回原函数的返回值 (BigUint64 或 Number)，同时写入 ctx.x[0]。
 unsafe extern "C" fn js_native_call_original(
     ctx: *mut ffi::JSContext,
     this_val: ffi::JSValue,
-    _argc: i32,
-    _argv: *mut ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
     let ctx_ptr = {
         let value = get_js_u64_property(ctx, this_val, "__hookCtxPtr") as *mut hook_ffi::HookContext;
@@ -239,11 +246,29 @@ unsafe extern "C" fn js_native_call_original(
         );
     }
 
+    // 同步 JS ctx 属性到 C HookContext（用户可能修改了 ctx.x0 等）
+    let hook_ctx = &mut *ctx_ptr;
+    for i in 0..31 {
+        let prop_name = format!("x{}", i);
+        hook_ctx.x[i] = get_js_u64_property(ctx, this_val, &prop_name);
+    }
+    hook_ctx.sp = get_js_u64_property(ctx, this_val, "sp");
+
+    // 如果 orig() 传了参数，按顺序覆盖 x0-xN (最多 x0-x30)
+    let max_args = (argc as usize).min(31);
+    for i in 0..max_args {
+        let val = crate::value::JSValue(*argv.add(i));
+        hook_ctx.x[i] = js_value_to_u64_or_zero(ctx, val);
+    }
+
     let _ = mark_native_hook_frame_orig_called(ctx_ptr, trampoline);
     let result = hook_ffi::hook_invoke_trampoline(ctx_ptr, trampoline as *mut std::ffi::c_void);
 
     // Write result back to HookContext.x[0] so the thunk's final RET returns this value
     (*ctx_ptr).x[0] = result;
+
+    // 同步返回值到 JS ctx.x0 属性，使 ctx.orig() 后读 ctx.x0 能拿到返回值
+    set_js_u64_property(ctx, this_val, "x0", result);
 
     // Return value: Number (≤2^53) or BigUint64
     js_u64_to_js_number_or_bigint(ctx, result)

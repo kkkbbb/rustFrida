@@ -260,3 +260,60 @@ void qjs_update_stack_top(JSContext *ctx) {
     JSRuntime *rt = JS_GetRuntime(ctx);
     JS_UpdateStackTop(rt);
 }
+
+/*
+ * qjs_throw_error_with_message - 抛一个完整消息的 Error（绕开 256 字节截断）
+ *
+ * QuickJS 的 JS_ThrowInternalError / JS_ThrowTypeError 内部走 JS_ThrowError2，
+ * 用的是硬编码的 char buf[256] + vsnprintf —— 长消息会被截成 255 字节。
+ * 另外它把 fmt 当 printf 格式字符串，消息里含 % 会被误解析。
+ *
+ * 这里通过 `new ErrorClass(msg)` 的 JS 层路径构造 Error：
+ *   1. 从 globalThis 拿 Error 构造器 (InternalError / TypeError / Error 等)
+ *   2. 用 JS_NewStringLen 创建完整 message 值（无长度限制）
+ *   3. JS_CallConstructor 调用 `new ErrorClass(message)`
+ *   4. JS_Throw 抛出
+ *
+ * error_class_name 传 NULL 或未知类名时 fallback 到 Error。
+ */
+JSValue qjs_throw_error_with_message(JSContext *ctx,
+                                     const char *error_class_name,
+                                     const char *message,
+                                     size_t message_len) {
+    JSValue global = JS_GetGlobalObject(ctx);
+    if (JS_IsException(global)) {
+        return JS_EXCEPTION;
+    }
+
+    const char *cls_name = (error_class_name && *error_class_name)
+                               ? error_class_name
+                               : "Error";
+    JSValue ctor = JS_GetPropertyStr(ctx, global, cls_name);
+    if (JS_IsException(ctor) || !JS_IsFunction(ctx, ctor)) {
+        JS_FreeValue(ctx, ctor);
+        /* fallback 到 Error */
+        ctor = JS_GetPropertyStr(ctx, global, "Error");
+    }
+    JS_FreeValue(ctx, global);
+
+    if (JS_IsException(ctor) || !JS_IsFunction(ctx, ctor)) {
+        JS_FreeValue(ctx, ctor);
+        /* 最坏情况: 走短版本避免 crash */
+        return JS_ThrowInternalError(ctx, "%s", message);
+    }
+
+    JSValue msg_val = JS_NewStringLen(ctx, message, message_len);
+    if (JS_IsException(msg_val)) {
+        JS_FreeValue(ctx, ctor);
+        return JS_EXCEPTION;
+    }
+
+    JSValue err = JS_CallConstructor(ctx, ctor, 1, &msg_val);
+    JS_FreeValue(ctx, msg_val);
+    JS_FreeValue(ctx, ctor);
+
+    if (JS_IsException(err)) {
+        return JS_EXCEPTION;
+    }
+    return JS_Throw(ctx, err);
+}
