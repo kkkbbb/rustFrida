@@ -51,7 +51,7 @@ struct hide_result* get_hide_result(void) {
 
 #define FAIL(code, msg) do { \
     g_hide_result.status = (code); \
-    strncpy(g_hide_result.error, (msg), sizeof(g_hide_result.error) - 1); \
+    snprintf(g_hide_result.error, sizeof(g_hide_result.error), "%s", (msg)); \
     return; \
 } while(0)
 
@@ -90,8 +90,7 @@ static int find_linker64(uint64_t *base, char *path, size_t path_size) {
         if (path_start) {
             char *nl = strchr(path_start, '\n');
             if (nl) *nl = 0;
-            strncpy(path, path_start, path_size - 1);
-            path[path_size - 1] = 0;
+            snprintf(path, path_size, "%s", path_start);
         }
 
         *base = start;
@@ -125,7 +124,8 @@ static int resolve_linker_syms(const char *path, uint64_t base, linker_syms_t *o
     if (fread(&ehdr, sizeof(ehdr), 1, f) != 1) { fclose(f); return -1; }
     if (memcmp(ehdr.e_ident, "\x7f""ELF", 4) != 0) { fclose(f); return -1; }
 
-    Elf64_Shdr *shdrs = malloc(ehdr.e_shnum * sizeof(Elf64_Shdr));
+    if (ehdr.e_shnum == 0) { fclose(f); return -1; }
+    Elf64_Shdr *shdrs = calloc(ehdr.e_shnum, sizeof(Elf64_Shdr));
     if (!shdrs) { fclose(f); return -1; }
     fseek(f, ehdr.e_shoff, SEEK_SET);
     if (fread(shdrs, sizeof(Elf64_Shdr), ehdr.e_shnum, f) != ehdr.e_shnum) {
@@ -301,7 +301,7 @@ static void hide_from_solist(void) {
 
     /* 记录 head 路径（调试用） */
     const char *hp = get_path(head);
-    if (hp) strncpy(g_hide_result.head_path, hp, sizeof(g_hide_result.head_path) - 1);
+    if (hp) snprintf(g_hide_result.head_path, sizeof(g_hide_result.head_path), "%s", hp);
 
     /* 5. 遍历链表，查找 memfd 加载的目标 */
     remove_soinfo_fn do_remove = (remove_soinfo_fn)syms.solist_remove_soinfo;
@@ -314,7 +314,7 @@ static void hide_from_solist(void) {
 
         if (path && strstr(path, "wwb_so")) {
             g_hide_result.target_ptr = (uint64_t)cur;
-            strncpy(g_hide_result.target_path, path, sizeof(g_hide_result.target_path) - 1);
+            snprintf(g_hide_result.target_path, sizeof(g_hide_result.target_path), "%s", path);
 
             /* 保存 unhide 所需的 linker 符号 */
             g_hide_result.solist_add_soinfo = syms.solist_add_soinfo;
