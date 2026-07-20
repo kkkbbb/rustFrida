@@ -18,6 +18,17 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 
+/* Android may map the carrier executable page with PROT_BTI (VmFlags: bt).
+ * These functions are reached through patched GOT/JNI function pointers, so
+ * every indirect-call target must start with a BTI c landing pad.  Keep this
+ * function-scoped: enabling branch protection for the whole payload can push
+ * the one-page zymbiote over its 4096-byte size limit. */
+#if defined(__aarch64__)
+# define RUSTFRIDA_BTI_ENTRY __attribute__((target("branch-protection=bti")))
+#else
+# define RUSTFRIDA_BTI_ENTRY
+#endif
+
 /* ========== ZymbioteContext ========== */
 /* 此结构体的布局必须与 Rust 侧（spawn.rs）写入顺序完全一致 */
 typedef struct _ZymbioteContext ZymbioteContext;
@@ -572,6 +583,7 @@ struct cap_data {
  * CAP_SYS_ADMIN = 21，在第一组（caps[0]）中。 */
 
 __attribute__((visibility("default")))
+RUSTFRIDA_BTI_ENTRY
 int
 rustfrida_zymbiote_replacement_capset(struct cap_header *hdrp, struct cap_data *datap)
 {
@@ -611,6 +623,7 @@ rustfrida_zymbiote_replacement_capset(struct cap_header *hdrp, struct cap_data *
 /* ========== setcontext 替换函数 ========== */
 __attribute__((section(".text.entrypoint")))
 __attribute__((visibility("default")))
+RUSTFRIDA_BTI_ENTRY
 int
 rustfrida_zymbiote_replacement_setcontext(uid_t uid, bool is_system_server, const char *seinfo, const char *name)
 {
@@ -660,6 +673,7 @@ rustfrida_zymbiote_replacement_setcontext(uid_t uid, bool is_system_server, cons
 /* ========== setArgV0 替换函数 ========== */
 __attribute__((section(".text.entrypoint")))
 __attribute__((visibility("default")))
+RUSTFRIDA_BTI_ENTRY
 int
 rustfrida_zymbiote_replacement_setargv0(JNIEnv *env, jobject clazz, jstring name)
 {
