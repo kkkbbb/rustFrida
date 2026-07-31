@@ -303,7 +303,6 @@ curl -X POST http://127.0.0.1:9191/rpc/0/ping
 - Native 只改参数并继续执行，用 `Interceptor.attach({ onEnter })`。
 - Native 需要决定是否调用原函数，用 `hook()` / `Interceptor.replace()`。
 - 高频 Native 热路径用 `CModule` 写 C callback，再用 `attachNative` / `hookNative` 安装。
-- 不知道用哪个 stealth 模式时先用默认模式；遇到检测或只读代码页问题再切 `Hook.WXSHADOW` / `Hook.RECOMP`。
 
 ---
 
@@ -724,7 +723,6 @@ Interceptor.flush();           // no-op，兼容脚本
 ```js
 hook(target, callback, Hook.NORMAL)     // 0: mprotect 直写（默认）
 hook(target, callback, Hook.WXSHADOW)   // 1: 内核 shadow 页，/proc/mem 不可见
-hook(target, callback, Hook.RECOMP)     // 2: 代码页重编译，仅 4B patch
 hook(target, callback, 1)               // 数字也行
 hook(target, callback, true)            // true = WXSHADOW
 ```
@@ -1166,7 +1164,6 @@ var MyCls = Java.findClassWithLoader(loaders[0], "com.example.MyClass");
 ```js
 Java.setStealth(0);  // Normal: mprotect 直写
 Java.setStealth(1);  // WxShadow: shadow 页，CRC 校验不可见
-Java.setStealth(2);  // Recomp: 代码页重编译
 Java.getStealth();   // 查询当前模式 (0/1/2)
 ```
 
