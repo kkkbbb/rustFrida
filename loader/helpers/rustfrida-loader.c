@@ -87,6 +87,9 @@
 #ifndef R_AARCH64_RELATIVE
 # define R_AARCH64_RELATIVE 1027
 #endif
+#ifndef R_AARCH64_TLSDESC
+# define R_AARCH64_TLSDESC 1031
+#endif
 #ifndef STT_GNU_IFUNC
 # define STT_GNU_IFUNC 10
 #endif
@@ -1013,6 +1016,10 @@ rustfrida_apply_relocations (RustFridaLinkedModule * module, ElfW(Rela) * rela, 
         if (!rustfrida_resolve_symbol (module, sym_index, libc, &symbol_value))
           return false;
         *target = symbol_value + r->r_addend;
+        break;
+      case R_AARCH64_TLSDESC:
+        /* TLSDESC: set to 0 (we don't use TLS, skip resolution) */
+        *target = 0;
         break;
       default:
         if (libc->sprintf != NULL)

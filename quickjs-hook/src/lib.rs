@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! quickjs-hook - QuickJS JavaScript engine with inline hook support for ARM64 Android
 //!
 //! This crate provides:

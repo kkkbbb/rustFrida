@@ -4,9 +4,112 @@ ARM64 Android 动态插桩框架。
 
 ## 环境要求
 
-- Android NDK 25+（默认路径 `~/Android/Sdk/ndk/`）
-- Rust toolchain + `aarch64-linux-android` target
-- Python 3（构建 loader shellcode）
+### 必需依赖
+
+| 依赖 | 版本要求 | macOS 安装 | Linux 安装 |
+|------|---------|-----------|-----------|
+| **Android NDK** | 25+ | `~/Library/Android/sdk/ndk/` | `~/Android/Sdk/ndk/` |
+| **Rust** | 1.70+ | 见下方安装步骤 | 见下方安装步骤 |
+| **Python** | 3.8+ | `brew install python3` | `sudo apt install python3` |
+| **Git** | 2.0+ | `brew install git` | `sudo apt install git` |
+
+### 平台差异说明
+
+| 项目 | macOS (Apple Silicon) | macOS (Intel) | Linux (x86_64) |
+|------|---------------------|--------------|----------------|
+| NDK 主机标签 | `darwin-x86_64` | `darwin-x86_64` | `linux-x86_64` |
+| 构建脚本自动检测 | ✅ | ✅ | ✅ |
+| 额外配置 | 无 | 无 | 可能需要安装 `build-essential` |
+
+### 首次安装指南
+
+#### 1. 安装 Android NDK
+
+**macOS (通过 Android Studio):**
+```bash
+# 安装 Android Studio 后，打开 SDK Manager
+# SDK Tools → Android NDK (Side by side) → 勾选 27.x 或更高版本
+# 默认安装路径: ~/Library/Android/sdk/ndk/
+
+# 验证安装
+ls ~/Library/Android/sdk/ndk/  # 应显示版本号如 27.2.12479018
+```
+
+**Linux (通过命令行):**
+```bash
+# 方法1: 使用 SDK 命令行工具
+sdkmanager "ndk;27.2.12479018"
+
+# 方法2: 手动下载
+# 访问 https://developer.android.com/ndk/downloads
+# 解压到 ~/Android/Sdk/ndk/
+
+# 验证安装
+ls ~/Android/Sdk/ndk/  # 应显示版本号
+```
+
+#### 2. 安装 Rust 工具链
+
+**macOS & Linux 通用:**
+```bash
+# 安装 Rust (使用 rustup)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# 加载环境变量
+source ~/.cargo/env
+
+# 验证安装
+rustc --version  # 应显示 rustc 1.70.0 或更高
+cargo --version
+
+# 添加 Android ARM64 目标
+rustup target add aarch64-linux-android
+
+# 验证目标已添加
+rustup target list | grep aarch64-linux-android  # 应显示已安装
+```
+
+#### 3. 安装 Python 3
+
+**macOS:**
+```bash
+# 使用 Homebrew
+brew install python3
+
+# 验证
+python3 --version  # 应显示 Python 3.8+
+```
+
+**Linux (Ubuntu/Debian):**
+```bash
+sudo apt update
+sudo apt install python3 python3-pip
+
+# 验证
+python3 --version
+```
+
+#### 4. 验证环境配置
+
+```bash
+# 运行环境配置脚本（会自动检测 NDK 并生成 .cargo/config.local.toml）
+python3 loader/setup_env.py
+
+# 成功输出示例:
+# === rustFrida 构建环境配置 ===
+# 主机平台: darwin-x86_64
+# NDK 路径: /Users/xxx/Library/Android/sdk/ndk/27.2.12479018
+# Clang:    /Users/xxx/.../aarch64-linux-android33-clang
+# Builtins: /Users/xxx/.../lib/clang/18/lib/baremetal
+# 已生成: .cargo/config.local.toml
+```
+
+### 其他依赖
+
+- **Android NDK 25+**（默认路径 `~/Android/Sdk/ndk/` 或 `~/Library/Android/sdk/ndk/`）
+- **Rust toolchain** + `aarch64-linux-android` target
+- **Python 3.8+**（构建 loader shellcode）
+- **Git 2.0+**（子仓库管理）
 - `.cargo/config.toml` 已配置交叉编译（仓库自带）
 
 首次 clone 后先拉取子仓库：
@@ -27,10 +130,63 @@ loader shellcode  ──┐
 agent (libagent.so) ┘
 ```
 
+### 快速构建（推荐）
+
+使用 `quickstart.sh` 一键完成所有构建步骤：
+
+```bash
+chmod +x scripts/quickstart.sh
+./scripts/quickstart.sh
+```
+
+该脚本会自动：
+1. ✅ 检查基础工具（git、python3、rustc、cargo）
+2. ✅ 检查 Android ARM64 目标
+3. ✅ 检测 Android NDK（支持 macOS/Linux 默认路径）
+4. ✅ 生成 `.cargo/config.toml` 配置
+5. ✅ 初始化子仓库
+6. ✅ 构建 loader shellcode（bootstrapper + rustfrida-loader）
+7. ✅ 构建 agent（libagent.so）
+8. ✅ 构建 rustfrida 主程序
+
+构建成功后产物位置：
+- `loader/build/bootstrapper.bin`
+- `loader/build/rustfrida-loader.bin`
+- `target/aarch64-linux-android/release/libagent.so`
+- `target/aarch64-linux-android/release/rustfrida`
+
+**修改了 loader C 代码或 agent Rust 代码后，重新运行 quickstart.sh 即可。**
+
+### 构建前检查清单
+
+在开始构建前，请确认：
+
+```bash
+# ✅ 1. 检查 NDK 是否已安装
+ls ~/Library/Android/sdk/ndk/  # macOS
+ls ~/Android/Sdk/ndk/          # Linux
+# 应显示版本号，如 27.2.12479018
+
+# ✅ 2. 检查 Rust 是否已安装
+rustc --version
+cargo --version
+rustup target list | grep aarch64-linux-android
+
+# ✅ 3. 检查 Python 3
+python3 --version
+
+# ✅ 4. 拉取子仓库（首次）
+git submodule update --init --recursive
+
+# ✅ 5. 运行环境配置脚本
+python3 loader/setup_env.py
+# 应看到“已生成: .cargo/config.local.toml”
+```
+
 ### 1. 构建 loader shellcode（bootstrapper + rustfrida-loader）
 
 ```bash
-python3 build_helpers.py
+python3 loader/build_helpers.py
 # 输出:
 #   loader/build/bootstrapper.bin
 #   loader/build/rustfrida-loader.bin
@@ -38,7 +194,27 @@ python3 build_helpers.py
 
 loader 是 bare-metal ARM64 shellcode，被 `rustfrida` 通过 `include_bytes!` 嵌入。**修改 loader C 代码后需重新运行此步。**
 
+#### 常见错误排查
+
+| 错误信息 | 原因 | 解决方法 |
+|---------|------|----------|
+| `错误: NDK 目录不存在` | NDK 未安装或路径不对 | 检查 `~/Library/Android/sdk/ndk/` (macOS) 或 `~/Android/Sdk/ndk/` (Linux) |
+| `未找到 clang` | NDK 版本过低 (< 25) | 安装 NDK 25+ 版本 |
+| `invalid argument '-mcmodel=large'` | 编译标志冲突 | 确保使用最新代码（已修复此问题） |
+| `unsupported relocation type: 1031` | loader 不支持 TLSDESC 重定位 | 已修复：quickstart.sh 会自动构建包含 TLSDESC 支持的 loader |
+
+**重定位类型 1031 说明**：
+- `R_AARCH64_TLSDESC` (1031) 是 AArch64 线程局部存储（TLS）的动态描述符重定位
+- `libagent.so` 会生成 2 个 TLSDESC 重定位
+- rustfrida-loader 现在支持此类型，会将其设为 0（项目不使用 TLS）
+- 如果你手动构建（不使用 quickstart.sh），确保使用最新的 loader 代码
+
 ### 2. 构建 agent（libagent.so）
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source ~/.cargo/env
+rustup target add aarch64-linux-android
+```
 
 ```bash
 cargo build -p agent --release

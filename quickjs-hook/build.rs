@@ -163,7 +163,7 @@ fn main() {
     }
 
     // Generate bindings for hook_engine (includes arm64_writer and arm64_relocator)
-    let hook_bindings = bindgen::Builder::default()
+    let mut hook_builder = bindgen::Builder::default()
         .header(src_path.join("hook_engine.h").to_string_lossy().to_string())
         .header(src_path.join("arm64_writer.h").to_string_lossy().to_string())
         .header(src_path.join("arm64_relocator.h").to_string_lossy().to_string())
@@ -194,7 +194,28 @@ fn main() {
         .allowlist_var("g_orig_bypass")
         .allowlist_var("g_orig_bypass_active")
         .allowlist_type("OrigBypassState")
-        .use_core()
+        .use_core();
+
+    // Add Android-specific clang args for bindgen when cross-compiling
+    if target.contains("android") {
+        // Tell clang to use Android target so it looks for Android headers
+        hook_builder = hook_builder
+            .clang_arg("-target")
+            .clang_arg("aarch64-linux-android33");
+        
+        // Try to get sysroot from environment variables
+        if let Ok(sysroot) = env::var("BINDGEN_EXTRA_CLANG_ARGS") {
+            // Extract --sysroot from BINDGEN_EXTRA_CLANG_ARGS
+            for arg in sysroot.split_whitespace() {
+                if arg.starts_with("--sysroot=") {
+                    hook_builder = hook_builder.clang_arg(arg);
+                    break;
+                }
+            }
+        }
+    }
+
+    let hook_bindings = hook_builder
         .generate()
         .expect("Unable to generate hook_engine bindings");
 

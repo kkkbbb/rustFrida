@@ -1,4 +1,5 @@
 #![cfg(all(target_os = "android", target_arch = "aarch64"))]
+#![allow(dead_code)]
 
 /// 生成 UnsafeCell 包装结构体，自动实现 Send + Sync。
 /// 用于将非 Send/Sync 类型安全地存入 OnceLock 全局变量。
@@ -170,7 +171,7 @@ pub extern "C" fn hello_entry(args_ptr: *mut c_void) -> *mut c_void {
     raw_thread::sleep_ms(100);
     flush_cached_logs();
 
-    let mut reader = sock;
+    let reader = sock;
     let reader_fd_for_raw = reader.as_raw_fd();
     loop {
         let mut header = [0u8; 5];

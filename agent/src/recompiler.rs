@@ -537,7 +537,7 @@ pub fn recompile(addr: usize, pid: u32) -> Result<(usize, RecompileStats)> {
 }
 
 /// 释放重编译页
-pub fn release(addr: usize, pid: u32) -> Result<()> {
+pub fn release(addr: usize, _pid: u32) -> Result<()> {
     ensure_init();
 
     let page_size = unsafe { sysconf(_SC_PAGESIZE) as usize };

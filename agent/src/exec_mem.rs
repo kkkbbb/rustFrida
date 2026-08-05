@@ -16,6 +16,9 @@ pub struct ExecMem {
     page_size: usize,
 }
 
+// ExecMem wraps mmap'd RWX memory; safe to send across threads when behind Mutex
+unsafe impl Send for ExecMem {}
+
 impl ExecMem {
     /// 新建一块可读写可执行内存（自动按页分配）
     pub fn new() -> Result<Self> {

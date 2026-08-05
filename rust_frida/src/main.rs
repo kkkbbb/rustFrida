@@ -33,7 +33,9 @@ use clap::Parser;
 #[cfg(feature = "qbdi")]
 use communication::send_qbdi_helper;
 use communication::{send_command, start_socketpair_handler};
-use injection::{inject_via_bootstrapper, watch_and_inject, InjectionResult};
+use injection::{inject_via_bootstrapper, InjectionResult};
+#[cfg(feature = "ldmonitor")]
+use injection::watch_and_inject;
 use nix::sys::ptrace;
 use nix::unistd::Pid;
 use process::{attach_to_process, call_target_function, find_pid_by_name};
@@ -310,17 +312,25 @@ fn main() {
                 std::process::exit(1);
             }
         }
-    } else if let Some(so_pattern) = &args.watch_so {
-        // 使用 eBPF 监听 SO 加载
-        if let Err(e) = crate::selinux::patch_selinux() {
-            log_warn!("SELinux patch 失败（非致命）: {}", e);
-        }
-        match watch_and_inject(so_pattern, args.timeout, &string_overrides) {
-            Ok(result) => (Some(result.target_pid), result),
-            Err(e) => {
-                log_error!("注入失败: {}", e);
-                std::process::exit(1);
+    } else if let Some(_so_pattern) = &args.watch_so {
+        #[cfg(feature = "ldmonitor")]
+        {
+            // 使用 eBPF 监听 SO 加载
+            if let Err(e) = crate::selinux::patch_selinux() {
+                log_warn!("SELinux patch 失败（非致命）: {}", e);
             }
+            match watch_and_inject(_so_pattern, args.timeout, &string_overrides) {
+                Ok(result) => (Some(result.target_pid), result),
+                Err(e) => {
+                    log_error!("注入失败: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        #[cfg(not(feature = "ldmonitor"))]
+        {
+            log_error!("--watch-so 需要启用 ldmonitor feature，请使用 cargo build -p rust_frida --release --features ldmonitor");
+            std::process::exit(1);
         }
     } else if let Some(pid) = resolved_pid {
         // 直接附加到指定 PID（来自 --pid 或 --name 解析结果）

@@ -14,28 +14,59 @@ import os
 import sys
 import subprocess
 import shutil
+import platform
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 HELPERS_DIR = os.path.join(SCRIPT_DIR, "helpers")
 BUILD_DIR = os.path.join(SCRIPT_DIR, "build")
 
-# Android NDK setup
-NDK_BASE = os.path.expanduser("~/Android/Sdk/ndk")
+# Android NDK setup — 自动检测主机平台
+NDK_BASE = os.path.expanduser("~/Library/Android/sdk/ndk/")
+
+def _host_tag():
+    """返回 NDK prebuilt 目录的主机标签 (darwin-x86_64 / linux-x86_64 / windows-x86_64)。"""
+    system = platform.system().lower()
+    if system == "darwin":
+        return "darwin-x86_64"
+    elif system == "linux":
+        return "linux-x86_64"
+    elif system == "windows":
+        return "windows-x86_64"
+    else:
+        print(f"警告: 未知平台 {system}，回退到 linux-x86_64")
+        return "linux-x86_64"
+
+HOST_TAG = _host_tag()
+
+def _version_key(name):
+    """将 NDK 版本字符串转为可比较的整数元组。"""
+    try:
+        return tuple(int(x) for x in name.split("."))
+    except ValueError:
+        return (0,)
 
 def find_ndk():
-    """Find the latest Android NDK."""
+    """Find the latest Android NDK (>= 25)."""
     if not os.path.isdir(NDK_BASE):
         print(f"错误: NDK 目录不存在: {NDK_BASE}")
         sys.exit(1)
-    versions = sorted(os.listdir(NDK_BASE), reverse=True)
+    versions = [v for v in os.listdir(NDK_BASE)
+                if os.path.isdir(os.path.join(NDK_BASE, v))]
     if not versions:
         print("错误: 未找到 NDK 版本")
         sys.exit(1)
-    return os.path.join(NDK_BASE, versions[0])
+    # 按版本号降序排列，优先选 >= 25 的最新版本
+    versions.sort(key=_version_key, reverse=True)
+    # 筛选 >= 25 的版本
+    suitable = [v for v in versions if _version_key(v)[0] >= 25]
+    chosen = suitable[0] if suitable else versions[0]
+    if not suitable:
+        print(f"警告: 未找到 NDK >= 25，使用 {chosen}")
+    return os.path.join(NDK_BASE, chosen)
 
 def find_tool(ndk_path, tool):
     """Find an NDK tool in the toolchain."""
-    toolchain = os.path.join(ndk_path, "toolchains", "llvm", "prebuilt", "linux-x86_64", "bin")
+    toolchain = os.path.join(ndk_path, "toolchains", "llvm", "prebuilt", HOST_TAG, "bin")
     # Try llvm- prefixed first
     llvm_tool = os.path.join(toolchain, f"llvm-{tool}")
     if os.path.isfile(llvm_tool):
@@ -48,7 +79,7 @@ def find_tool(ndk_path, tool):
 
 def find_clang(ndk_path, api=33):
     """Find the NDK clang for aarch64."""
-    toolchain = os.path.join(ndk_path, "toolchains", "llvm", "prebuilt", "linux-x86_64", "bin")
+    toolchain = os.path.join(ndk_path, "toolchains", "llvm", "prebuilt", HOST_TAG, "bin")
     clang = os.path.join(toolchain, f"aarch64-linux-android{api}-clang")
     if os.path.isfile(clang):
         return clang
@@ -88,13 +119,13 @@ def build_shellcode(cc, ld, objcopy, sources, output_name, extra_cflags=None):
     # Common flags
     cflags = [
         "-target", "aarch64-linux-android33",
-        "-fPIC",
-        "-fno-stack-protector",
-        "-fvisibility=hidden",
+        "-fPIC",                      # 位置无关代码（必须）
+        "-fno-builtin",               # 禁用内置函数
+        "-fno-stack-protector",       # 禁用栈保护
+        "-fvisibility=hidden",        # 隐藏符号
         "-fno-function-sections",
         "-fno-data-sections",
         "-fno-asynchronous-unwind-tables",
-        # "-fno-optimize-strlen",  # GCC only, clang doesn't need it
         "-fomit-frame-pointer",
         "-O2",
         "-Wall",
@@ -144,6 +175,7 @@ def main():
     # Find NDK
     ndk = find_ndk()
     print(f"NDK: {ndk}")
+    print(f"Host: {HOST_TAG}")
 
     cc = find_clang(ndk)
     if not cc:

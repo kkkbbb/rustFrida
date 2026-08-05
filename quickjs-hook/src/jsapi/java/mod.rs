@@ -49,7 +49,6 @@ pub(crate) mod reflect;
 
 mod safe_mem;
 
-pub(crate) use art_class::run_pending_checkpoints as run_pending_art_checkpoints;
 pub use java_hook_api::managed_native_counter_value;
 pub(crate) use jni_core::ensure_jni_initialized;
 pub(crate) use reflect::get_class_name_unchecked;

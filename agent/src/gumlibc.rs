@@ -1,5 +1,5 @@
-use libc::{c_int, c_long, pid_t, SYS_kill, SYS_wait4};
-use libc::{SYS_clone, SYS_exit, SYS_ptrace, SYS_waitid};
+use libc::{c_long, pid_t, SYS_kill, SYS_wait4};
+use libc::{SYS_clone, SYS_exit, SYS_ptrace};
 use std::arch::asm;
 use std::ffi::c_void;
 

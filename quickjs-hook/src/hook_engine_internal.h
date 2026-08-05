@@ -12,7 +12,9 @@
 #include "arm64_relocator.h"
 #include <string.h>
 #include <sys/mman.h>
+#ifdef __ANDROID__
 #include <sys/prctl.h>
+#endif
 #include <sys/uio.h>
 #include <unistd.h>
 #include <stdarg.h>

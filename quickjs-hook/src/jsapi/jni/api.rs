@@ -46,7 +46,7 @@ unsafe fn raw_clone_string_arg(
     ctx: *mut ffi::JSContext,
     argc: i32,
     argv: *mut ffi::JSValue,
-    func_name: &str,
+    _func_name: &str,
     argc_with_explicit_env: i32,
     type_error: &'static [u8],
 ) -> Result<String, ffi::JSValue> {

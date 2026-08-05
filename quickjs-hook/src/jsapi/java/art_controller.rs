@@ -1939,9 +1939,9 @@ unsafe extern "C" fn walkstack_sigsegv_handler(
     context: *mut libc::c_void,
 ) {
     unsafe fn chain_prev_sigsegv(sig: libc::c_int, info: *mut libc::siginfo_t, context: *mut libc::c_void) {
-        let prev = &PREV_SIGSEGV_ACTION;
-        let prev_handler = prev.sa_sigaction;
-        if prev.sa_flags & libc::SA_SIGINFO != 0 {
+        let prev = std::ptr::addr_of!(PREV_SIGSEGV_ACTION);
+        let prev_handler = std::ptr::addr_of!((*prev).sa_sigaction).read();
+        if std::ptr::addr_of!((*prev).sa_flags).read() & libc::SA_SIGINFO != 0 {
             let handler: unsafe extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void) =
                 std::mem::transmute(prev_handler);
             handler(sig, info, context);
@@ -2160,11 +2160,11 @@ unsafe fn install_walkstack_sigsegv_guard() {
     }
 
     let mut sa: libc::sigaction = std::mem::zeroed();
-    sa.sa_sigaction = walkstack_sigsegv_handler as usize;
+    sa.sa_sigaction = walkstack_sigsegv_handler as *const () as usize;
     sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
     libc::sigemptyset(&mut sa.sa_mask);
 
-    let ret = bionic_sigaction(libc::SIGSEGV, &sa, &mut PREV_SIGSEGV_ACTION);
+    let ret = bionic_sigaction(libc::SIGSEGV, &sa, std::ptr::addr_of_mut!(PREV_SIGSEGV_ACTION));
     if ret == 0 {
         output_verbose("[artController] WalkStack SIGSEGV guard 已安装");
     } else {
@@ -2200,9 +2200,9 @@ unsafe fn uninstall_walkstack_sigsegv_guard() {
         return;
     }
 
-    let ret = bionic_sigaction(libc::SIGSEGV, &PREV_SIGSEGV_ACTION, std::ptr::null_mut());
+    let ret = bionic_sigaction(libc::SIGSEGV, std::ptr::addr_of!(PREV_SIGSEGV_ACTION), std::ptr::null_mut());
     if ret == 0 {
-        PREV_SIGSEGV_ACTION = std::mem::zeroed();
+        std::ptr::addr_of_mut!(PREV_SIGSEGV_ACTION).write(std::mem::zeroed());
         output_verbose("[artController] WalkStack SIGSEGV guard 已卸载");
     } else {
         output_verbose(&format!(
@@ -2227,12 +2227,12 @@ pub(crate) unsafe fn refresh_walkstack_sigsegv_guard() {
     if bionic_sigaction(libc::SIGSEGV, std::ptr::null(), &mut current) != 0 {
         return;
     }
-    if current.sa_sigaction == walkstack_sigsegv_handler as usize {
+    if current.sa_sigaction == walkstack_sigsegv_handler as *const () as usize {
         return;
     }
 
     let mut sa: libc::sigaction = std::mem::zeroed();
-    sa.sa_sigaction = walkstack_sigsegv_handler as usize;
+    sa.sa_sigaction = walkstack_sigsegv_handler as *const () as usize;
     sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
     libc::sigemptyset(&mut sa.sa_mask);
 

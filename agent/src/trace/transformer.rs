@@ -10,8 +10,8 @@ use libc::{
     c_int, mmap, pid_t, CLONE_SETTLS, CLONE_VM, MAP_ANONYMOUS, MAP_PRIVATE, PROT_READ, PROT_WRITE, PR_SET_NAME,
     PTRACE_DETACH,
 };
-use once_cell::unsync::Lazy;
-use std::ptr::null_mut;
+use once_cell::sync::Lazy;
+use std::ptr::{addr_of_mut, null_mut};
 use std::sync::Mutex;
 
 type Result<T> = std::result::Result<T, String>;
@@ -19,7 +19,7 @@ type Result<T> = std::result::Result<T, String>;
 // ============== 静态变量 ==============
 
 static mut INSTRUCT_PTR: *const u32 = null_mut();
-static mut EXE_MEM: Lazy<Mutex<ExecMem>> = Lazy::new(|| Mutex::new(ExecMem::new().unwrap()));
+static EXE_MEM: Lazy<Mutex<ExecMem>> = Lazy::new(|| Mutex::new(ExecMem::new().unwrap()));
 
 // ============== 转换器 ==============
 
@@ -29,20 +29,21 @@ extern "C" {
 
 /// 返回 mtransform 函数地址，供 arm64_codegen 使用
 pub fn mtransform_addr() -> usize {
-    mtransform as usize
+    mtransform as *const () as usize
 }
 
 #[no_mangle]
-pub extern "C" fn transformer_wrapper_full(ctx: [usize; 32]) -> usize {
+pub extern "C" fn transformer_wrapper_full(ctx: *const usize) -> usize {
     unsafe {
         let mut vall = UserRegs::default();
         let mut log = String::from("context: \n");
         for i in 0..31 {
-            vall.regs[i] = ctx[31 - i];
-            log.push_str(&format!("regs[{}] = {:x}\n", i, ctx[31 - i]));
+            vall.regs[i] = *ctx.add(31 - i);
+            log.push_str(&format!("regs[{}] = {:x}\n", i, *ctx.add(31 - i)));
         }
-        vall.pstate = ctx[0];
-        let addr = resolve_next_addr(INSTRUCT_PTR, vall).unwrap();
+        vall.pstate = *ctx;
+        let instruct_ptr = *addr_of_mut!(INSTRUCT_PTR);
+        let addr = resolve_next_addr(instruct_ptr, vall).unwrap();
 
         match transformer_global(addr) {
             Ok(addr) => addr,
@@ -55,20 +56,21 @@ pub extern "C" fn transformer_wrapper_full(ctx: [usize; 32]) -> usize {
 
 pub fn transformer_global(addr: usize) -> Result<usize> {
     unsafe {
+        let ip = addr_of_mut!(INSTRUCT_PTR);
         let mut exe_mem = EXE_MEM.lock().unwrap();
         let ret_addr = exe_mem.current_addr();
 
-        if is_arm64_call(*INSTRUCT_PTR) {
-            for instr in gen_mov_reg_addr(30, INSTRUCT_PTR.add(1) as usize) {
+        if is_arm64_call(**ip) {
+            for instr in gen_mov_reg_addr(30, (*ip).add(1) as usize) {
                 exe_mem.write_u32(instr)?;
             }
         }
 
-        INSTRUCT_PTR = addr as *const u32;
+        *ip = addr as *const u32;
         let closure_result = {
-            while !is_arm64_branch(*INSTRUCT_PTR) {
-                arm64_relocator::relocate_one_a64(INSTRUCT_PTR as usize, exe_mem.external_write_instruct());
-                INSTRUCT_PTR = INSTRUCT_PTR.add(1);
+            while !is_arm64_branch(**ip) {
+                arm64_relocator::relocate_one_a64(**ip as usize, exe_mem.external_write_instruct());
+                *ip = (*ip).add(1);
             }
             Ok(())
         };
@@ -77,7 +79,7 @@ pub fn transformer_global(addr: usize) -> Result<usize> {
             Err(e) => {
                 write_stream(e);
                 exe_mem.reset();
-                transformer_global(addr);
+                let _ = transformer_global(addr);
             }
         }
 
@@ -137,15 +139,16 @@ extern "C" fn tracer(thread_id: i32) -> c_int {
                 return -1;
             }
         }
+        let ip = addr_of_mut!(INSTRUCT_PTR);
         let mut exe_mem = EXE_MEM.lock().unwrap();
 
         let mut regs = get_registers(thread_id).unwrap();
-        INSTRUCT_PTR = regs.pc as *const u32;
-        write_stream(("\nget pc: ".to_string() + &(INSTRUCT_PTR as usize).to_string()).as_bytes());
+        *ip = regs.pc as *const u32;
+        write_stream(("\nget pc: ".to_string() + &(*ip as usize).to_string()).as_bytes());
 
-        while !is_arm64_branch(*INSTRUCT_PTR) {
-            arm64_relocator::relocate_one_a64(INSTRUCT_PTR as usize, exe_mem.external_write_instruct());
-            INSTRUCT_PTR = INSTRUCT_PTR.add(1);
+        while !is_arm64_branch(**ip) {
+            arm64_relocator::relocate_one_a64(**ip as usize, exe_mem.external_write_instruct());
+            *ip = (*ip).add(1);
         }
 
         for instruct in gen_jump_to_transformer() {

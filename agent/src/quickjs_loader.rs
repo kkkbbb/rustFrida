@@ -490,7 +490,7 @@ pub fn cleanup() -> bool {
     use std::time::Instant;
     let t0 = Instant::now();
     let mut t = t0;
-    let mut stage = |label: &str, prev: &mut Instant| {
+    let stage = |label: &str, prev: &mut Instant| {
         let now = Instant::now();
         let delta = now.duration_since(*prev).as_millis();
         let total = now.duration_since(t0).as_millis();
@@ -696,7 +696,7 @@ pub fn cleanup_for_unload_leak_safe() -> bool {
     use std::time::Instant;
     let t0 = Instant::now();
     let mut t = t0;
-    let mut stage = |label: &str, prev: &mut Instant| {
+    let stage = |label: &str, prev: &mut Instant| {
         let now = Instant::now();
         let delta = now.duration_since(*prev).as_millis();
         let total = now.duration_since(t0).as_millis();
@@ -824,7 +824,7 @@ pub fn cleanup_soft() -> Result<(), String> {
 
     let t0 = Instant::now();
     let mut t = t0;
-    let mut stage = |label: &str, prev: &mut Instant| {
+    let stage = |label: &str, prev: &mut Instant| {
         let now = Instant::now();
         let delta = now.duration_since(*prev).as_millis();
         let total = now.duration_since(t0).as_millis();
