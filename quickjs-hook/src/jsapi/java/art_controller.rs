@@ -251,21 +251,25 @@ unsafe fn try_fixup_trampoline(trampoline: *mut std::ffi::c_void, orig_addr: u64
 /// Java.setStealth(1/2) 是严格模式；准备失败时调用方必须放弃该 hook，
 /// 不能回退到原始地址 + sflag=0，否则会暴露普通 inline/mprotect 特征。
 ///
-/// 返回 (hook_addr, stealth_flag):
-///   Normal:   (resolved_addr, 0)
-///   WxShadow: (resolved_addr, 1)
-///   Recomp:   (recomp slot, 0)
+/// 返回 (hook_addr, stealth_flag, real_addr):
+///   Normal:   (resolved_addr, 0, resolved_addr)
+///   WxShadow: (resolved_addr, 1, resolved_addr)
+///   Recomp:   (recomp slot, 0, resolved_addr)
+///
+/// real_addr 是真正分配/提交 recomp slot 的原始代码地址。调用方在
+/// try_fixup_trampoline/commit_slot_patch 时必须使用 real_addr，不能使用
+/// resolve 前的逻辑入口地址，否则 ART trampoline 入口会显示安装成功但不生效。
 ///
 /// jni_env 用于 resolve ART tiny trampoline (LDR+BR)，非 art_router 场景传 null
-pub(super) unsafe fn prepare_hook_target(addr: u64, jni_env: *mut std::ffi::c_void) -> Result<(u64, i32), String> {
+pub(super) unsafe fn prepare_hook_target(addr: u64, jni_env: *mut std::ffi::c_void) -> Result<(u64, i32, u64), String> {
     // 1. Resolve ART trampoline（所有模式都先 resolve）
     let resolved = hook_ffi::resolve_art_trampoline(addr as *mut std::ffi::c_void, jni_env);
     let real_addr = if !resolved.is_null() { resolved as u64 } else { addr };
 
     // 2. 按 stealth 模式处理
     match stealth_mode() {
-        StealthMode::Normal => Ok((real_addr, 0)),
-        StealthMode::WxShadow => Ok((real_addr, 1)),
+        StealthMode::Normal => Ok((real_addr, 0, real_addr)),
+        StealthMode::WxShadow => Ok((real_addr, 1, real_addr)),
         StealthMode::Recomp => {
             // Recomp 模式: recomp 代码页上写 1 条 B→slot，slot 里由 hook engine 写 thunk。
             // sflag=0 让 hook engine 把 slot 当普通地址处理，无需知道 stealth2。
@@ -279,12 +283,16 @@ pub(super) unsafe fn prepare_hook_target(addr: u64, jni_env: *mut std::ffi::c_vo
             }
             let slot = crate::recomp::alloc_trampoline_slot(real_addr as usize)
                 .map_err(|e| format!("recomp slot {:#x}: {}", real_addr, e))?;
-            Ok((slot as u64, 0))
+            Ok((slot as u64, 0, real_addr))
         }
     }
 }
 
-unsafe fn prepare_hook_target_strict(label: &str, addr: u64, jni_env: *mut std::ffi::c_void) -> Option<(u64, i32)> {
+unsafe fn prepare_hook_target_strict(
+    label: &str,
+    addr: u64,
+    jni_env: *mut std::ffi::c_void,
+) -> Option<(u64, i32, u64)> {
     match prepare_hook_target(addr, jni_env) {
         Ok(v) => Some(v),
         Err(e) => {
@@ -510,6 +518,8 @@ pub(super) fn jni_trampoline_router_installed() -> bool {
 
 /// 记录已安装的 artController 全局 hook 信息
 struct ArtControllerState {
+    /// Layer 1 源入口地址，用于 stealth2 下按逻辑入口去重。
+    shared_stub_sources: Vec<u64>,
     /// Layer 1: 已 hook 的共享 stub 地址 (jni_trampoline, interpreter_bridge, resolution)
     shared_stub_targets: Vec<u64>,
     /// Layer 2: 已 hook 的 DoCall 函数地址
@@ -594,6 +604,7 @@ pub(super) fn ensure_art_controller_initialized(
     //   - stealth=1/2 时 Layer 1 直接覆盖 nterp / interpreter / generic JNI entrypoints
 
     let mut shared_stub_targets = Vec::new();
+    let mut shared_stub_sources = Vec::new();
     let mut do_call_targets = Vec::new();
 
     // --- Layer 1: 共享 stub 路由 hook ---
@@ -611,21 +622,32 @@ pub(super) fn ensure_art_controller_initialized(
             "[artController] Layer 1: quick_generic_jni_trampoline skipped in normal mode; enable Java.setStealth(1/2) for shared JNI native routing",
         );
     } else {
-        stubs.push(("quick_generic_jni_trampoline", bridge.quick_generic_jni_trampoline));
+        stubs.push((
+            "quick_generic_jni_trampoline",
+            bridge.quick_generic_jni_trampoline,
+            false,
+        ));
     }
     if bridge.nterp_entry_point != 0 && stealth_mode() != StealthMode::Normal {
-        stubs.push(("nterp_entry_point", bridge.nterp_entry_point));
+        stubs.push(("nterp_entry_point", bridge.nterp_entry_point, true));
     }
-    stubs.push(("quick_to_interpreter_bridge", bridge.quick_to_interpreter_bridge));
-    stubs.push(("quick_resolution_trampoline", bridge.quick_resolution_trampoline));
+    if bridge.nterp_with_clinit_entry_point != 0 && stealth_mode() != StealthMode::Normal {
+        stubs.push((
+            "nterp_with_clinit_entry_point",
+            bridge.nterp_with_clinit_entry_point,
+            true,
+        ));
+    }
+    stubs.push(("quick_to_interpreter_bridge", bridge.quick_to_interpreter_bridge, false));
+    stubs.push(("quick_resolution_trampoline", bridge.quick_resolution_trampoline, false));
 
-    for (name, addr) in &stubs {
+    for (name, addr, pre_scan) in &stubs {
         if *addr == 0 {
             output_verbose(&format!("[artController] Layer 1: {} 地址为0，跳过", name));
             continue;
         }
         let mut hooked_target: *mut std::ffi::c_void = std::ptr::null_mut();
-        let (hook_addr, sflag) = match unsafe { prepare_hook_target(*addr, env) } {
+        let (hook_addr, sflag, real_addr) = match unsafe { prepare_hook_target(*addr, env) } {
             Ok(v) => v,
             Err(e) => {
                 output_verbose(&format!("[artController] Layer 1: {} prepare failed: {}", name, e));
@@ -642,17 +664,19 @@ pub(super) fn ensure_art_controller_initialized(
                 1, // skip_resolve: 已在 prepare_hook_target 中 resolve
                 0, // no hint — replacement is kAccNative, ART handles it
                 0, // use_blr=0: Layer 1 shared stubs 不用 BLR
+                if *pre_scan { 1 } else { 0 },
             )
         };
         if !trampoline.is_null() {
             // stealth2: 修复 trampoline（hook engine 从 slot 读到的是清零字节）
-            unsafe { try_fixup_trampoline(trampoline, *addr) };
+            unsafe { try_fixup_trampoline(trampoline, real_addr) };
             // 使用实际被 hook 的地址 (可能经过 resolve_art_trampoline 解析)
             let actual_target = if !hooked_target.is_null() {
                 hooked_target as u64
             } else {
-                *addr
+                hook_addr
             };
+            shared_stub_sources.push(*addr);
             shared_stub_targets.push(actual_target);
 
             // 保存 jni_trampoline 的 bypass (trampoline) 地址
@@ -661,8 +685,8 @@ pub(super) fn ensure_art_controller_initialized(
             }
 
             output_verbose(&format!(
-                "[artController] Layer 1: {} hook 安装成功: {:#x} (hooked={:#x}), trampoline={:#x}",
-                name, addr, actual_target, trampoline as u64
+                "[artController] Layer 1: {} hook 安装成功: source={:#x}, real={:#x}, hooked={:#x}, trampoline={:#x}",
+                name, addr, real_addr, actual_target, trampoline as u64
             ));
             // 验证 inline hook 是否真的写入
             unsafe {
@@ -688,7 +712,8 @@ pub(super) fn ensure_art_controller_initialized(
                 continue;
             }
             let label = format!("Layer 2: DoCall[{}]", i);
-            let Some((ha, sf)) = (unsafe { prepare_hook_target_strict(&label, addr, std::ptr::null_mut()) }) else {
+            let Some((ha, sf, real_addr)) = (unsafe { prepare_hook_target_strict(&label, addr, std::ptr::null_mut()) })
+            else {
                 continue;
             };
             let ret = unsafe {
@@ -696,7 +721,7 @@ pub(super) fn ensure_art_controller_initialized(
                 hook_ffi::hook_attach(ha as *mut std::ffi::c_void, Some(on_do_call_enter), None, is_range, sf)
             };
             if ret == 0 {
-                unsafe { try_fixup_trampoline(hook_ffi::hook_get_trampoline(ha as *mut std::ffi::c_void), addr) };
+                unsafe { try_fixup_trampoline(hook_ffi::hook_get_trampoline(ha as *mut std::ffi::c_void), real_addr) };
                 do_call_targets.push(ha);
                 output_verbose(&format!(
                     "[artController] Layer 2: DoCall[{}] hook 安装成功: {:#x} (hooked={:#x})",
@@ -719,7 +744,7 @@ pub(super) fn ensure_art_controller_initialized(
 
     // Fix 3: hook CopyingPhase/MarkingPhase on_leave
     if bridge.gc_copying_phase != 0 {
-        if let Some((ha, sf)) =
+        if let Some((ha, sf, real_addr)) =
             unsafe { prepare_hook_target_strict("GC CopyingPhase", bridge.gc_copying_phase, std::ptr::null_mut()) }
         {
             let ret = unsafe {
@@ -732,12 +757,7 @@ pub(super) fn ensure_art_controller_initialized(
                 )
             };
             if ret == 0 {
-                unsafe {
-                    try_fixup_trampoline(
-                        hook_ffi::hook_get_trampoline(ha as *mut std::ffi::c_void),
-                        bridge.gc_copying_phase,
-                    )
-                };
+                unsafe { try_fixup_trampoline(hook_ffi::hook_get_trampoline(ha as *mut std::ffi::c_void), real_addr) };
                 gc_hook_targets.push(ha);
                 output_verbose(&format!(
                     "[artController] GC CopyingPhase hook 安装成功: {:#x} (hooked={:#x})",
@@ -754,7 +774,7 @@ pub(super) fn ensure_art_controller_initialized(
 
     // Fix 3: hook CollectGarbageInternal on_leave (主 GC 入口)
     if bridge.gc_collect_internal != 0 {
-        if let Some((ha, sf)) = unsafe {
+        if let Some((ha, sf, real_addr)) = unsafe {
             prepare_hook_target_strict(
                 "GC CollectGarbageInternal",
                 bridge.gc_collect_internal,
@@ -771,12 +791,7 @@ pub(super) fn ensure_art_controller_initialized(
                 )
             };
             if ret == 0 {
-                unsafe {
-                    try_fixup_trampoline(
-                        hook_ffi::hook_get_trampoline(ha as *mut std::ffi::c_void),
-                        bridge.gc_collect_internal,
-                    )
-                };
+                unsafe { try_fixup_trampoline(hook_ffi::hook_get_trampoline(ha as *mut std::ffi::c_void), real_addr) };
                 gc_hook_targets.push(ha);
                 output_verbose(&format!(
                     "[artController] GC CollectGarbageInternal hook 安装成功: {:#x} (hooked={:#x})",
@@ -793,7 +808,7 @@ pub(super) fn ensure_art_controller_initialized(
 
     // Fix 3: hook RunFlipFunction on_enter (线程翻转期间同步)
     if bridge.run_flip_function != 0 {
-        if let Some((ha, sf)) =
+        if let Some((ha, sf, real_addr)) =
             unsafe { prepare_hook_target_strict("GC RunFlipFunction", bridge.run_flip_function, std::ptr::null_mut()) }
         {
             let ret = unsafe {
@@ -806,12 +821,7 @@ pub(super) fn ensure_art_controller_initialized(
                 )
             };
             if ret == 0 {
-                unsafe {
-                    try_fixup_trampoline(
-                        hook_ffi::hook_get_trampoline(ha as *mut std::ffi::c_void),
-                        bridge.run_flip_function,
-                    )
-                };
+                unsafe { try_fixup_trampoline(hook_ffi::hook_get_trampoline(ha as *mut std::ffi::c_void), real_addr) };
                 gc_hook_targets.push(ha);
                 output_verbose(&format!(
                     "[artController] GC RunFlipFunction hook 安装成功: {:#x} (hooked={:#x})",
@@ -831,7 +841,7 @@ pub(super) fn ensure_art_controller_initialized(
     // 对 replacement method 返回 NULL, 防止 ART 查找堆分配方法的 OAT 代码头。
     let mut oat_header_hook_target: u64 = 0;
     if bridge.get_oat_quick_method_header != 0 {
-        if let Some((ha, sf)) = unsafe {
+        if let Some((ha, sf, real_addr)) = unsafe {
             prepare_hook_target_strict(
                 "GetOatQuickMethodHeader",
                 bridge.get_oat_quick_method_header,
@@ -847,7 +857,7 @@ pub(super) fn ensure_art_controller_initialized(
                 )
             };
             if !trampoline.is_null() {
-                unsafe { try_fixup_trampoline(trampoline, bridge.get_oat_quick_method_header) };
+                unsafe { try_fixup_trampoline(trampoline, real_addr) };
                 oat_header_hook_target = ha;
                 output_verbose(&format!(
                     "[artController] GetOatQuickMethodHeader hook 安装成功: {:#x} (hooked={:#x}), trampoline={:#x}",
@@ -866,7 +876,7 @@ pub(super) fn ensure_art_controller_initialized(
     // 类初始化完成后同步 replacement 方法，防止 quickCode 被更新绕过 hook
     let mut fixup_hook_target: u64 = 0;
     if bridge.fixup_static_trampolines != 0 {
-        if let Some((ha, sf)) = unsafe {
+        if let Some((ha, sf, real_addr)) = unsafe {
             prepare_hook_target_strict(
                 "FixupStaticTrampolines",
                 bridge.fixup_static_trampolines,
@@ -883,12 +893,7 @@ pub(super) fn ensure_art_controller_initialized(
                 )
             };
             if ret == 0 {
-                unsafe {
-                    try_fixup_trampoline(
-                        hook_ffi::hook_get_trampoline(ha as *mut std::ffi::c_void),
-                        bridge.fixup_static_trampolines,
-                    )
-                };
+                unsafe { try_fixup_trampoline(hook_ffi::hook_get_trampoline(ha as *mut std::ffi::c_void), real_addr) };
                 fixup_hook_target = ha;
                 output_verbose(&format!(
                     "[artController] FixupStaticTrampolines hook 安装成功: {:#x} (hooked={:#x})",
@@ -909,7 +914,7 @@ pub(super) fn ensure_art_controller_initialized(
     // SIGSEGV walkstack guards below.
     let mut pretty_method_hook_target: u64 = 0;
     if false && bridge.pretty_method != 0 {
-        if let Some((ha, sf)) =
+        if let Some((ha, sf, real_addr)) =
             unsafe { prepare_hook_target_strict("PrettyMethod", bridge.pretty_method, std::ptr::null_mut()) }
         {
             let ret = unsafe {
@@ -922,12 +927,7 @@ pub(super) fn ensure_art_controller_initialized(
                 )
             };
             if ret == 0 {
-                unsafe {
-                    try_fixup_trampoline(
-                        hook_ffi::hook_get_trampoline(ha as *mut std::ffi::c_void),
-                        bridge.pretty_method,
-                    )
-                };
+                unsafe { try_fixup_trampoline(hook_ffi::hook_get_trampoline(ha as *mut std::ffi::c_void), real_addr) };
                 pretty_method_hook_target = ha;
                 output_verbose(&format!(
                     "[artController] PrettyMethod hook 安装成功: {:#x} (hooked={:#x})",
@@ -945,7 +945,9 @@ pub(super) fn ensure_art_controller_initialized(
     // --- Fix 8: patch 内联 GetOatQuickMethodHeader ---
     // libart.so 内联了 GetOatQuickMethodHeader 的 data_!=-1 检查,
     // hook_replace 只拦截非内联调用。内联点需要单独 patch。
-    let oat_inline_patched: i32 = unsafe { hook_ffi::hook_patch_inlined_oat_header_checks() };
+    // 传入 GetOatQuickMethodHeader 本体地址，避免模式扫描把本体当作内联副本 patch。
+    let oat_inline_patched: i32 =
+        unsafe { hook_ffi::hook_patch_inlined_oat_header_checks(bridge.get_oat_quick_method_header) };
 
     // API 36 的 GC WalkStack 可直接调用 DecodeGcMasksOnly(NULL)。信号 fallback
     // 容易被 app 后装的 crash handler 挤掉，所以主动在 DecodeGcMasksOnly 的
@@ -974,6 +976,7 @@ pub(super) fn ensure_art_controller_initialized(
     ));
 
     *controller = Some(ArtControllerState {
+        shared_stub_sources,
         shared_stub_targets,
         do_call_targets,
         gc_hook_targets,
@@ -984,6 +987,82 @@ pub(super) fn ensure_art_controller_initialized(
     });
     drop(controller);
     maybe_install_raw_clone_executor_loop_hook(env);
+}
+
+/// 动态补充 shared ART entry 的全局 router。
+///
+/// 某些 Android 构建拿不到 nterp entrypoint，或者目标方法的 entry_point_
+/// 指向 libart 内未归类的解释器入口。这里不修改 ArtMethod.entry_point_，
+/// 只在该 libart 入口上安装共享 router，再由 router table 按 ArtMethod 分发。
+pub(super) unsafe fn ensure_shared_entry_router_hook(
+    label: &str,
+    entry_point: u64,
+    ep_offset: usize,
+    env: JniEnv,
+    pre_scan: bool,
+) -> Result<(), String> {
+    if entry_point == 0 {
+        return Err(format!("{} entry_point is null", label));
+    }
+
+    let mut controller = ART_CONTROLLER.lock().unwrap_or_else(|e| e.into_inner());
+    let state = controller
+        .as_mut()
+        .ok_or_else(|| format!("{} requested before artController initialized", label))?;
+
+    if state.shared_stub_sources.contains(&entry_point) {
+        output_verbose(&format!(
+            "[artController] Layer 1 dynamic: {} already routed: source={:#x}",
+            label, entry_point
+        ));
+        return Ok(());
+    }
+
+    let mut hooked_target: *mut std::ffi::c_void = std::ptr::null_mut();
+    let (hook_addr, sflag, real_addr) =
+        prepare_hook_target(entry_point, env as *mut std::ffi::c_void).map_err(|e| {
+            format!(
+                "Layer 1 dynamic {} prepare failed: source={:#x}, {}",
+                label, entry_point, e
+            )
+        })?;
+
+    let trampoline = hook_ffi::hook_install_art_router(
+        hook_addr as *mut std::ffi::c_void,
+        ep_offset as u32,
+        sflag,
+        env as *mut std::ffi::c_void,
+        &mut hooked_target,
+        1,
+        0,
+        0,
+        if pre_scan { 1 } else { 0 },
+    );
+    if trampoline.is_null() {
+        return Err(format!(
+            "Layer 1 dynamic {} hook_install_art_router failed: source={:#x}, hook={:#x}",
+            label, entry_point, hook_addr
+        ));
+    }
+
+    try_fixup_trampoline(trampoline, real_addr);
+
+    let actual_target = if !hooked_target.is_null() {
+        hooked_target as u64
+    } else {
+        hook_addr
+    };
+    state.shared_stub_sources.push(entry_point);
+    if !state.shared_stub_targets.contains(&actual_target) {
+        state.shared_stub_targets.push(actual_target);
+    }
+
+    output_verbose(&format!(
+        "[artController] Layer 1 dynamic: {} hook 安装成功: source={:#x}, real={:#x}, hooked={:#x}, trampoline={:#x}",
+        label, entry_point, real_addr, actual_target, trampoline as u64
+    ));
+    hook_ffi::hook_dump_code(actual_target as *mut std::ffi::c_void, 20);
+    Ok(())
 }
 
 // ============================================================================
@@ -1132,7 +1211,7 @@ unsafe extern "C" fn on_do_call_enter(ctx_ptr: *mut hook_ffi::HookContext, _user
         if !should_replace_for_stack(replacement) {
             return; // managed stack 递归 — 走 tail-jump
         }
-        if route_mode != 4 {
+        if route_mode < 4 {
             // 同步 declaring_class_: replacement (malloc'd) 不被 GC 追踪，
             // GC 移动 declaring class 后 replacement 的 declaring_class_ 可能 stale。
             // Managed DSL 的 replacement 是真实 dex 方法，declaring_class_ 必须保持 helper 类。
@@ -1353,6 +1432,12 @@ pub unsafe extern "C" fn art_router_stack_check(replacement: u64) -> i32 {
     }
 
     let original_for_js = hook_ffi::hook_art_router_table_lookup_original(replacement);
+    if hook_ffi::hook_art_router_table_lookup_mode_by_replacement(replacement) >= 4 {
+        if original_for_js != 0 && call_original_bypass_contains(original_for_js) {
+            return 0;
+        }
+        return if should_replace_for_stack(replacement) { 1 } else { 0 };
+    }
     if !should_sample_original_method(original_for_js) {
         return 0;
     }
@@ -2015,7 +2100,8 @@ unsafe fn install_decode_gc_masks_only_null_guard() -> u64 {
         return 0;
     }
 
-    let Some((ha, sf)) = prepare_hook_target_strict("DecodeGcMasksOnly NULL guard", load_target, std::ptr::null_mut())
+    let Some((ha, sf, real_addr)) =
+        prepare_hook_target_strict("DecodeGcMasksOnly NULL guard", load_target, std::ptr::null_mut())
     else {
         return 0;
     };
@@ -2027,6 +2113,10 @@ unsafe fn install_decode_gc_masks_only_null_guard() -> u64 {
         sf,
     );
     if ret == 0 {
+        if !try_fixup_trampoline(hook_ffi::hook_get_trampoline(ha as *mut std::ffi::c_void), real_addr) {
+            let _ = hook_ffi::hook_remove(ha as *mut std::ffi::c_void);
+            return 0;
+        }
         output_verbose(&format!(
             "[artController] DecodeGcMasksOnly NULL guard 安装成功: load={:#x} (hooked={:#x})",
             load_target, ha
@@ -2231,19 +2321,17 @@ unsafe fn remove_art_controller_hook(label: &str, addr: u64) {
 pub fn cut_art_controller_walkstack_guards() {
     let targets: Vec<(&'static str, u64)> = {
         let guard = ART_CONTROLLER.lock().unwrap_or_else(|e| e.into_inner());
-        let state = match guard.as_ref() {
-            Some(s) => s,
-            None => return,
-        };
         let mut all: Vec<(&str, u64)> = Vec::new();
-        if state.oat_header_hook_target != 0 {
-            all.push(("OatHeader", state.oat_header_hook_target));
-        }
-        if state.pretty_method_hook_target != 0 {
-            all.push(("PrettyMethod", state.pretty_method_hook_target));
-        }
-        if state.decode_gc_masks_hook_target != 0 {
-            all.push(("DecodeGcMasks", state.decode_gc_masks_hook_target));
+        if let Some(state) = guard.as_ref() {
+            if state.oat_header_hook_target != 0 {
+                all.push(("OatHeader", state.oat_header_hook_target));
+            }
+            if state.pretty_method_hook_target != 0 {
+                all.push(("PrettyMethod", state.pretty_method_hook_target));
+            }
+            if state.decode_gc_masks_hook_target != 0 {
+                all.push(("DecodeGcMasks", state.decode_gc_masks_hook_target));
+            }
         }
         all
     };

@@ -21,6 +21,7 @@ pub(super) fn is_art_quick_entrypoint(addr: u64, bridge: &ArtBridgeFunctions) ->
         || addr == bridge.quick_resolution_trampoline
         || addr == bridge.quick_imt_conflict_trampoline
         || addr == bridge.nterp_entry_point
+        || addr == bridge.nterp_with_clinit_entry_point
     {
         return true;
     }
@@ -56,6 +57,19 @@ pub(crate) fn resolve_art_method(
             let _ = get_art_method_spec(env, 0);
         }
 
+        // For normal Java-worker calls, prefer ART's own class-loader aware
+        // MethodID resolution. The raw dex resolver is still kept for raw-clone
+        // contexts where JNI fallback is not safe.
+        if !env.is_null() && !crate::is_raw_clone_js_thread() {
+            match resolve_art_method_by_jni(env, class_name, method_name, signature, force_static) {
+                Ok(resolved) => return Ok(resolved),
+                Err(msg) => output_verbose(&format!(
+                    "[resolve_art_method] JNI first pass failed for {}.{}{}: {}; trying dex resolver",
+                    class_name, method_name, signature, msg
+                )),
+            }
+        }
+
         if let Some(resolved) = resolve_art_method_by_dex(env, class_name, method_name, signature, force_static) {
             return Ok(resolved);
         }
@@ -74,60 +88,63 @@ pub(crate) fn resolve_art_method(
         ));
     }
 
+    unsafe { resolve_art_method_by_jni(env, class_name, method_name, signature, force_static) }
+}
+
+unsafe fn resolve_art_method_by_jni(
+    env: JniEnv,
+    class_name: &str,
+    method_name: &str,
+    signature: &str,
+    force_static: bool,
+) -> Result<(u64, bool), String> {
     let c_method = CString::new(method_name).map_err(|_| "invalid method name")?;
     let c_sig = CString::new(signature).map_err(|_| "invalid signature")?;
 
-    unsafe {
-        let cls = find_class_safe(env, class_name);
+    let cls = find_class_safe(env, class_name);
 
-        if cls.is_null() {
-            // Defensive: ensure no pending exception leaks to caller
-            jni_check_exc(env);
-            return Err(format!("FindClass('{}') failed", class_name));
-        }
+    if cls.is_null() {
+        // Defensive: ensure no pending exception leaks to caller
+        jni_check_exc(env);
+        return Err(format!("FindClass('{}') failed", class_name));
+    }
 
-        let delete_local_ref: DeleteLocalRefFn =
-            jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
+    let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
 
-        // Try GetMethodID (instance method first), unless force_static
-        if !force_static {
-            let get_method_id: GetMethodIdFn = jni_fn!(env, GetMethodIdFn, JNI_GET_METHOD_ID);
+    // Try GetMethodID (instance method first), unless force_static
+    if !force_static {
+        let get_method_id: GetMethodIdFn = jni_fn!(env, GetMethodIdFn, JNI_GET_METHOD_ID);
 
-            let method_id = get_method_id(env, cls, c_method.as_ptr(), c_sig.as_ptr());
-            output_verbose(&format!(
-                "[resolve_art_method] cls={:#x}, GetMethodID({}.{}{})={:#x}",
-                cls as u64, class_name, method_name, signature, method_id as u64
-            ));
-
-            if !jni_null_or_exc(env, method_id) {
-                // Decode BEFORE deleting cls (ToReflectedMethod needs cls)
-                let art_method = decode_method_id(env, cls, method_id as u64, false);
-                delete_local_ref(env, cls);
-                return Ok((art_method, false));
-            }
-        }
-
-        // Try GetStaticMethodID
-        let get_static_method_id: GetStaticMethodIdFn =
-            jni_fn!(env, GetStaticMethodIdFn, JNI_GET_STATIC_METHOD_ID);
-
-        let method_id = get_static_method_id(env, cls, c_method.as_ptr(), c_sig.as_ptr());
+        let method_id = get_method_id(env, cls, c_method.as_ptr(), c_sig.as_ptr());
+        output_verbose(&format!(
+            "[resolve_art_method] cls={:#x}, GetMethodID({}.{}{})={:#x}",
+            cls as u64, class_name, method_name, signature, method_id as u64
+        ));
 
         if !jni_null_or_exc(env, method_id) {
             // Decode BEFORE deleting cls (ToReflectedMethod needs cls)
-            let art_method = decode_method_id(env, cls, method_id as u64, true);
+            let art_method = decode_method_id(env, cls, method_id as u64, false);
             delete_local_ref(env, cls);
-            return Ok((art_method, true));
+            return Ok((art_method, false));
         }
-
-        // Cleanup
-        delete_local_ref(env, cls);
-
-        Err(format!(
-            "method not found: {}.{}{}",
-            class_name, method_name, signature
-        ))
     }
+
+    // Try GetStaticMethodID
+    let get_static_method_id: GetStaticMethodIdFn = jni_fn!(env, GetStaticMethodIdFn, JNI_GET_STATIC_METHOD_ID);
+
+    let method_id = get_static_method_id(env, cls, c_method.as_ptr(), c_sig.as_ptr());
+
+    if !jni_null_or_exc(env, method_id) {
+        // Decode BEFORE deleting cls (ToReflectedMethod needs cls)
+        let art_method = decode_method_id(env, cls, method_id as u64, true);
+        delete_local_ref(env, cls);
+        return Ok((art_method, true));
+    }
+
+    // Cleanup
+    delete_local_ref(env, cls);
+
+    Err(format!("method not found: {}.{}{}", class_name, method_name, signature))
 }
 
 /// Read the entry_point_from_quick_compiled_code_ from ArtMethod

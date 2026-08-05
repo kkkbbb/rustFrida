@@ -215,6 +215,7 @@ pub(super) type NewDirectByteBufferFn =
     unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, i64) -> *mut std::ffi::c_void;
 pub(super) type RegisterNativesFn =
     unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *const JniNativeMethod, i32) -> i32;
+pub(super) type UnregisterNativesFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void) -> i32;
 
 #[repr(C)]
 pub(super) struct JniNativeMethod {
@@ -857,6 +858,7 @@ pub(super) const JNI_NEW_LOCAL_REF: usize = 25;
 pub(super) const JNI_MONITOR_ENTER: usize = 217;
 pub(super) const JNI_MONITOR_EXIT: usize = 218;
 pub(super) const JNI_REGISTER_NATIVES: usize = 215;
+pub(super) const JNI_UNREGISTER_NATIVES: usize = 216;
 pub(super) const JNI_GET_PRIMITIVE_ARRAY_CRITICAL: usize = 222;
 pub(super) const JNI_RELEASE_PRIMITIVE_ARRAY_CRITICAL: usize = 223;
 pub(super) const JNI_NEW_DIRECT_BYTE_BUFFER: usize = 229;
@@ -923,10 +925,17 @@ pub(super) static JNI_STATE: Mutex<Option<JniState>> = Mutex::new(None);
 struct AttachedThreadGuard {
     vm: *mut std::ffi::c_void,
     env: JniEnv,
+    tid: i32,
 }
+
+static OWNED_THREAD_ATTACHMENT_TIDS: Mutex<Vec<i32>> = Mutex::new(Vec::new());
 
 impl Drop for AttachedThreadGuard {
     fn drop(&mut self) {
+        OWNED_THREAD_ATTACHMENT_TIDS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|tid| *tid != self.tid);
         unsafe {
             if !self.env.is_null() {
                 let _ = super::art_class::transition_current_thread_to_native_for_blocking(self.env);
@@ -1015,14 +1024,27 @@ pub(crate) fn ensure_jni_initialized() -> Result<JniEnv, String> {
         }
 
         let env = attach_current_thread(vm)?;
+        let tid = libc::syscall(libc::SYS_gettid) as i32;
         OWNED_THREAD_ATTACHMENT.with(|slot| {
-            *slot.borrow_mut() = Some(AttachedThreadGuard { vm, env });
+            *slot.borrow_mut() = Some(AttachedThreadGuard { vm, env, tid });
         });
+        let mut tids = OWNED_THREAD_ATTACHMENT_TIDS.lock().unwrap_or_else(|e| e.into_inner());
+        if !tids.contains(&tid) {
+            tids.push(tid);
+        }
         Ok(env)
     }
 }
 
 pub(crate) fn detach_current_thread_if_owned() {
+    let tid = unsafe { libc::syscall(libc::SYS_gettid) as i32 };
+    if !OWNED_THREAD_ATTACHMENT_TIDS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&tid)
+    {
+        return;
+    }
     OWNED_THREAD_ATTACHMENT.with(|slot| {
         let guard = slot.borrow_mut().take();
         drop(guard);

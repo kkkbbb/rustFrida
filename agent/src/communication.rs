@@ -8,7 +8,6 @@ use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
 
 const FRAME_KIND_CMD: u8 = 1;
 const FRAME_KIND_QBDI_HELPER: u8 = 2;
@@ -55,9 +54,7 @@ pub(crate) fn write_stream(data: &[u8]) {
             Err(std::sync::TryLockError::WouldBlock) => return,
             Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
         };
-        let _ = stream.set_write_timeout(Some(Duration::from_millis(10)));
         let _ = write_frame(&mut stream, FRAME_KIND_LOG, data);
-        let _ = stream.set_write_timeout(None);
     }
 }
 

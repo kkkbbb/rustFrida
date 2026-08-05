@@ -347,7 +347,7 @@ void* hook_create_native_trampoline(uint64_t key, HookCallback on_enter, void* u
 typedef struct {
     uint64_t original;      /* Original ArtMethod* (0 = sentinel / end marker) */
     uint64_t replacement;   /* Replacement ArtMethod* */
-    uint64_t mode;          /* 0 = replacement ArtMethod, 1 = quick callback */
+    uint64_t mode;          /* 0 = replacement, 1/2 = quick callback, 4/5 = managed helper */
     HookCallback quick_callback;
     void* quick_user_data;
 } ArtRouterEntry;
@@ -363,6 +363,16 @@ typedef struct {
 int hook_art_router_table_add(uint64_t original, uint64_t replacement);
 
 /*
+ * Add an entry routed to a managed helper ArtMethod. Mode 4/5 is published
+ * atomically with the table entry so high-frequency shared entrypoints never
+ * observe a temporary mode-0 helper replacement.
+ */
+int hook_art_router_table_add_managed(uint64_t original, uint64_t replacement,
+                                      void* sentinel);
+int hook_art_router_table_add_managed_mode(uint64_t original, uint64_t replacement,
+                                           void* sentinel, uint64_t mode);
+
+/*
  * Add an entry routed directly to a native quick callback.
  * The replacement ArtMethod is still used as a native stack-walk sentinel
  * while the callback runs, but execution does not go through ART's JNI
@@ -370,6 +380,9 @@ int hook_art_router_table_add(uint64_t original, uint64_t replacement);
  */
 int hook_art_router_table_add_quick(uint64_t original, uint64_t replacement,
                                     HookCallback callback, void* user_data);
+int hook_art_router_table_add_quick_mode(uint64_t original, uint64_t replacement,
+                                         HookCallback callback, void* user_data,
+                                         uint64_t mode);
 
 void hook_art_router_table_set_mode(uint64_t original, uint64_t mode);
 void hook_art_router_table_set_user_data(uint64_t original, void* user_data);
@@ -393,6 +406,7 @@ void hook_art_router_table_clear(void);
  * Returns 0 if not found.
  */
 uint64_t hook_art_router_table_lookup_original(uint64_t replacement);
+uint64_t hook_art_router_table_lookup_mode_by_replacement(uint64_t replacement);
 
 /*
  * Debug/statistics: called from ART DoCall hook to record whether an interpreted
@@ -479,6 +493,7 @@ void hook_art_router_get_route_stats(uint64_t* quick_hits,
                                      uint64_t* replacement_hits,
                                      uint64_t* do_call_table_hits,
                                      uint64_t* last_do_call_x0,
+                                     uint64_t* last_do_call_raw_x0,
                                      uint64_t* quick_pass_hits,
                                      uint64_t* quick_callback_calls,
                                      uint64_t* quick_skip_hits,
@@ -542,7 +557,8 @@ void* hook_install_art_router(void* target, uint32_t quickcode_offset,
                                void** out_hooked_target,
                                int skip_resolve,
                                uint64_t current_pc_hint,
-                               int use_blr);
+                               int use_blr,
+                               int pre_scan);
 
 void* hook_install_managed_direct_router(void* target,
                                          int stealth,
@@ -660,9 +676,11 @@ uint64_t hook_invoke_trampoline(HookContext* ctx, void* trampoline);
  * g_art_router_table). Replacement methods skip the OAT lookup to prevent
  * NULL+0x18 SIGSEGV in WalkStack.
  *
+ * @param exclude_addr  Function body address to exclude from the pattern scan
+ *                      (usually ArtMethod::GetOatQuickMethodHeader itself), or 0.
  * @return  Number of patterns patched (>=0), or negative error code
  */
-int hook_patch_inlined_oat_header_checks(void);
+int hook_patch_inlined_oat_header_checks(uint64_t exclude_addr);
 
 /*
  * Restore all inlined OAT header patches applied by hook_patch_inlined_oat_header_checks().

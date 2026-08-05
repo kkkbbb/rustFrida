@@ -126,6 +126,7 @@ pub(super) unsafe extern "C" fn js_java_inspect_art_method(
     // bridges 子对象
     let bridges = ffi::JS_NewObject(ctx);
     set_js_u64_property(ctx, bridges, "nterp", bridge.nterp_entry_point);
+    set_js_u64_property(ctx, bridges, "nterpWithClinit", bridge.nterp_with_clinit_entry_point);
     set_js_u64_property(ctx, bridges, "interpreterBridge", bridge.quick_to_interpreter_bridge);
     set_js_u64_property(ctx, bridges, "jniTrampoline", bridge.quick_generic_jni_trampoline);
     set_js_u64_property(ctx, bridges, "resolution", bridge.quick_resolution_trampoline);

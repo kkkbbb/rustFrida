@@ -95,6 +95,35 @@
         }
     }
 
+    function _withDirectHookBypassMany(keys, fn) {
+        for (var i = 0; i < keys.length; i++) {
+            _directHookBypass[keys[i]] = (_directHookBypass[keys[i]] || 0) + 1;
+        }
+        try {
+            return fn();
+        } finally {
+            for (var j = 0; j < keys.length; j++) {
+                var key = keys[j];
+                var n = (_directHookBypass[key] || 1) - 1;
+                if (n > 0) _directHookBypass[key] = n;
+                else delete _directHookBypass[key];
+            }
+        }
+    }
+
+    function _throwWithMessageStack(e) {
+        if (e && e.stack && e.message) {
+            var message = String(e);
+            var stack = String(e.stack);
+            if (stack.indexOf(message) < 0) {
+                try {
+                    e.stack = message + "\n" + stack;
+                } catch (_) {}
+            }
+        }
+        throw e;
+    }
+
     function _maybeInvokeDirectInstanceHook(target, cls, name, sig, args, fallback) {
         var key = _methodKey(cls, name, sig);
         var fn = _directHookImpls[key];
@@ -113,7 +142,9 @@
             __jglobal: target.__jglobal === true,
             __$orig: orig
         });
-        var ret = fn.apply(thisObj, args);
+        var ret = _withDirectHookBypass(key, function() {
+            return fn.apply(thisObj, args);
+        });
         return _wrapJavaReturn(ret);
     }
 
@@ -133,7 +164,9 @@
             $className: cls,
             $static: true
         };
-        var ret = fn.apply(fnThis, args);
+        var ret = _withDirectHookBypass(key, function() {
+            return fn.apply(fnThis, args);
+        });
         return _wrapJavaReturn(ret);
     }
 
@@ -587,6 +620,20 @@
         return invoker;
     }
 
+    function _makeHookOriginalInvoker(target, name) {
+        var invoker = function() {
+            return target.__$orig.apply(target, arguments);
+        };
+        invoker.overload = function() {
+            var sig = _resolveSingleOverload(target.__$hookClass || target.__jclass, name, arguments, null);
+            if (target.__$hookSig && sig !== target.__$hookSig) {
+                return _makeInstanceMethodInvoker(target, name, sig);
+            }
+            return _makeHookOriginalInvoker(target, name);
+        };
+        return invoker;
+    }
+
     // ========================================================================
     // Frida-style FieldWrapper: obj.field 返回 FieldWrapper，通过 .value 读写
     //   obj.field.value        — 读（每次 JNI GetField，无 FIELD_CACHE 锁）
@@ -779,6 +826,9 @@
                         );
                     };
                 }
+                if (target.__$orig && prop === target.__$hookName) {
+                    return _makeHookOriginalInvoker(target, prop);
+                }
 
                 // 已缓存 — 直接返回（FieldWrapper 或 hybrid 函数）
                 if (fieldWrappers[prop]) return fieldWrappers[prop];
@@ -880,6 +930,27 @@
         var ms = _getMethodList(wrapper._c);
         if (wrapper._cache) wrapper._cache.methods = ms;
         return ms;
+    }
+
+    function _getMethodListCached(cls, cache) {
+        if (cache && cache.methods) return cache.methods;
+        var ms = _getMethodList(cls);
+        if (cache) cache.methods = ms;
+        return ms;
+    }
+
+    function _isStaticMethodSig(cls, name, sig, cache) {
+        var ms = _getMethodListCached(cls, cache);
+        for (var i = 0; i < ms.length; i++) {
+            if (ms[i].name === name && ms[i].sig === sig) {
+                return ms[i].static === true;
+            }
+        }
+        return false;
+    }
+
+    function _compileSigForMethod(cls, name, sig, cache) {
+        return (_isStaticMethodSig(cls, name, sig, cache) ? "static:" : "") + sig;
     }
 
     // 根据参数签名前缀查找匹配的方法
@@ -991,10 +1062,14 @@
                 this._fn = null;
             } else {
                 var userFn = fn;
+                var bypassKeys = sigs.map(function(sig) {
+                    return _methodKey(cls, name, sig);
+                });
                 // wrapCallback 的 ctx 是 Rust 侧注入的内部 hook-ctx 对象，
                 // 保留用于 origCallOriginal.apply(ctx, ...) 让 js_call_original 读到
                 // __hookCtxPtr / __hookArtMethod，用户层不再可见。
-                var wrapCallback = function(ctx) {
+                var makeWrapCallback = function(hookSig) {
+                    return function(ctx) {
                     // Wrap args → JS Proxy for Java objects, 其它原样
                     var rawArgs = ctx.args || [];
                     var wrappedArgs = new Array(rawArgs.length);
@@ -1025,7 +1100,10 @@
                         fnThis = _wrapJavaObjOnTarget({
                             __jptr: thisObjRaw,
                             __jclass: cls,
-                            __$orig: origWrapped
+                            __$orig: origWrapped,
+                            __$hookClass: cls,
+                            __$hookName: name,
+                            __$hookSig: hookSig
                         });
                     } else {
                         // 静态方法: 简单对象 + Frida-style 入口
@@ -1035,15 +1113,22 @@
                             $static: true
                         };
                     }
-                    return userFn.apply(fnThis, wrappedArgs);
+                    return _withDirectHookBypassMany(bypassKeys, function() {
+                        return userFn.apply(fnThis, wrappedArgs);
+                    });
+                    };
                 };
                 for (var i = 0; i < sigs.length; i++) {
-                    _hook(cls, name, sigs[i], wrapCallback);
+                    _hook(cls, name, sigs[i], makeWrapCallback(sigs[i]));
                     _directHookImpls[_methodKey(cls, name, sigs[i])] = userFn;
                 }
                 this._fn = fn;
             }
         }
+    });
+    Object.defineProperty(MethodWrapper.prototype, "implementation", {
+        get: function() { return this.impl; },
+        set: function(fn) { this.impl = fn; }
     });
 
     Object.defineProperty(MethodWrapper.prototype, "dslImpl", {
@@ -1115,7 +1200,7 @@
                     for (var j = 0; j < installed.length; j++) {
                         try { _unhook(cls, name, installed[j]); } catch (_) {}
                     }
-                    throw e;
+                    _throwWithMessageStack(e);
                 }
                 this._dslCode = String(dslCode);
                 this._dslInfo = results.length === 1 ? results[0] : results;
@@ -1144,6 +1229,48 @@
         }
         return this;
     };
+
+    MethodWrapper.prototype.opt = function(kind) {
+        var name = this._m === "$init" ? "<init>" : this._m;
+        var cls = this._c;
+        var compileKind = "auto";
+        if (kind !== null && kind !== undefined) {
+            if (typeof kind === "object") {
+                compileKind = kind.kind || kind.mode || "auto";
+            } else {
+                compileKind = kind;
+            }
+        }
+
+        var sigs;
+        if (this._s === null) {
+            var ms = _getMethods(this);
+            var match = [];
+            for (var i = 0; i < ms.length; i++) {
+                if (ms[i].name === name) match.push(ms[i]);
+            }
+            if (match.length === 0)
+                throw new Error("Method not found: " + cls + "." + this._m);
+            sigs = match.map(function(m) { return m.sig; });
+        } else if (Array.isArray(this._s)) {
+            sigs = this._s;
+        } else {
+            sigs = [this._s];
+        }
+
+        var results = [];
+        for (var j = 0; j < sigs.length; j++) {
+            results.push(Java.compileMethod(
+                cls,
+                name,
+                _compileSigForMethod(cls, name, sigs[j], this._cache),
+                String(compileKind)
+            ));
+        }
+        return results.length === 1 ? results[0] : results;
+    };
+
+    MethodWrapper.prototype.compile = MethodWrapper.prototype.opt;
 
     Object.defineProperty(MethodWrapper.prototype, "dslInfo", {
         get: function() { return this._dslInfo || null; }
@@ -1286,6 +1413,16 @@
             enumerable: true,
             configurable: true
         });
+        Object.defineProperty(callable, "implementation", {
+            get: function() {
+                return wrapper.impl;
+            },
+            set: function(fn) {
+                wrapper.impl = fn;
+            },
+            enumerable: true,
+            configurable: true
+        });
 
         Object.defineProperty(callable, "dslImpl", {
             get: function() {
@@ -1320,6 +1457,14 @@
         callable.dsl = function(options) {
             wrapper.dsl(options);
             return callable;
+        };
+
+        callable.opt = function(kind) {
+            return wrapper.opt(kind);
+        };
+
+        callable.compile = function(kind) {
+            return wrapper.opt(kind);
         };
 
         callable.dslDrain = function(max) {

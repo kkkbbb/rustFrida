@@ -182,6 +182,7 @@ const CTX_RAISE: usize = 200;
 const CTX_PROP_REMAP: usize = 208;
 const CTX_BLOCK_IN_SETCONTEXT: usize = 216;
 const CTX_PASSIVE_SETARGV0: usize = 224;
+const SETARGV0_SCAN_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 /// 读取 stream 直到 EOF 或错误（用于等待子进程关闭 socket）
 fn drain_until_eof(stream: &mut std::os::unix::net::UnixStream, timeout: std::time::Duration) {
     stream.set_read_timeout(Some(timeout)).ok();
@@ -228,11 +229,14 @@ fn is_setargv0_rw_fallback_candidate(entry: &MapEntry) -> bool {
 }
 
 fn is_setargv0_readable_fallback_candidate(entry: &MapEntry) -> bool {
+    // libandroid_runtime.so 的 rodata 中也会保留静态 JNINativeMethod 表，
+    // 里面包含 setArgV0 函数指针，但 zygote 已完成 RegisterNatives，
+    // 该表不是后续 fork app 时使用的可写 native slot。选中它会导致
+    // 对 r--p 文件映射 pwrite 失败，且即使写入成功也不能稳定拦截。
     entry.path.contains("dalvik-")
         || entry.path.contains("boot-image")
         || entry.path.contains("boot.art")
         || entry.path.contains("boot-framework")
-        || entry.path.contains("libandroid_runtime")
 }
 
 /// 在 ELF dynsyms 中查找符号地址
@@ -241,6 +245,39 @@ fn find_dynsym_addr(elf: &goblin::elf::Elf, name: &str, base: u64) -> Option<u64
         .iter()
         .find(|sym| elf.dynstrtab.get_at(sym.st_name).map_or(false, |n| n == name))
         .map(|sym| base + sym.st_value)
+}
+
+fn map_load_bias(entry: &MapEntry) -> Option<u64> {
+    entry.start.checked_sub(entry.offset)
+}
+
+fn find_loaded_module(maps: &[MapEntry], suffix: &str) -> Option<(u64, String)> {
+    let matches_suffix = |entry: &MapEntry| entry.path.ends_with(suffix);
+    let has_matching_exec = |base: u64, path: &str| {
+        maps.iter().any(|entry| {
+            entry.path == path && entry.is_executable() && map_load_bias(entry).map_or(false, |bias| bias == base)
+        })
+    };
+
+    maps.iter()
+        .filter(|entry| matches_suffix(entry) && entry.offset == 0 && !entry.is_shared())
+        .find(|entry| has_matching_exec(entry.start, &entry.path))
+        .or_else(|| {
+            maps.iter()
+                .filter(|entry| matches_suffix(entry) && entry.offset == 0)
+                .find(|entry| has_matching_exec(entry.start, &entry.path))
+        })
+        .or_else(|| {
+            maps.iter()
+                .find(|entry| matches_suffix(entry) && entry.offset == 0 && !entry.is_shared())
+        })
+        .or_else(|| maps.iter().find(|entry| matches_suffix(entry) && entry.offset == 0))
+        .map(|entry| (entry.start, entry.path.clone()))
+        .or_else(|| {
+            maps.iter()
+                .find(|entry| matches_suffix(entry) && entry.is_executable())
+                .and_then(|entry| map_load_bias(entry).map(|base| (base, entry.path.clone())))
+        })
 }
 
 /// 共享的 spawn 前置步骤：确保 zymbiote 加载、注册请求、启动 App、等待 hello
@@ -1568,6 +1605,7 @@ fn inject_zymbiote(pid: u32, socket_name: &str) -> Result<ZygotePatch, String> {
     // 7. 找到 setArgV0 指针（三层兜底扫描：boot heap → ART RW private → ART readable）
     //    None: 三层全 miss，启用 setcontext-only 降级阻塞（要求 setcontext GOT 可用）
     let mut payload_data = payload_data;
+    let block_in_setcontext_flag_offset = ctx_base_in_payload + CTX_BLOCK_IN_SETCONTEXT - CTX_SOCKET_PATH;
     let setargv0_search = if diag_no_setargv0 {
         None
     } else {
@@ -1594,15 +1632,15 @@ fn inject_zymbiote(pid: u32, socket_name: &str) -> Result<ZygotePatch, String> {
         } else {
             log_warn!("降级为 setcontext-only 阻塞（Android 版本兼容路径）");
         }
-        let flag_offset = ctx_base_in_payload + CTX_BLOCK_IN_SETCONTEXT - CTX_SOCKET_PATH;
-        if flag_offset + 8 > payload_data.len() {
+        if block_in_setcontext_flag_offset + 8 > payload_data.len() {
             return Err(format!(
                 "block_in_setcontext 偏移越界: {} + 8 > {}",
-                flag_offset,
+                block_in_setcontext_flag_offset,
                 payload_data.len()
             ));
         }
-        payload_data[flag_offset..flag_offset + 8].copy_from_slice(&1u64.to_ne_bytes());
+        payload_data[block_in_setcontext_flag_offset..block_in_setcontext_flag_offset + 8]
+            .copy_from_slice(&1u64.to_ne_bytes());
     }
 
     // 8. SIGSTOP zygote
@@ -1702,13 +1740,41 @@ fn inject_zymbiote(pid: u32, socket_name: &str) -> Result<ZygotePatch, String> {
 
     // 10. 替换 setArgV0 指针 → zymbiote replacement（Some 时）
     let setargv0_slot = if let Some((addr, backup, _)) = setargv0_search {
-        mem.pwrite_all(&replacement_setargv0_addr.to_ne_bytes(), addr)?;
-        log_verbose!(
-            "setArgV0 指针已替换: 0x{:x} → 0x{:x}",
-            u64::from_ne_bytes(backup),
-            replacement_setargv0_addr
-        );
-        Some((addr, backup))
+        match mem.pwrite_all(&replacement_setargv0_addr.to_ne_bytes(), addr) {
+            Ok(()) => {
+                log_verbose!(
+                    "setArgV0 指针已替换: 0x{:x} → 0x{:x}",
+                    u64::from_ne_bytes(backup),
+                    replacement_setargv0_addr
+                );
+                Some((addr, backup))
+            }
+            Err(e) => {
+                if !matches!(&setcontext_info, Some((_, Some(_)))) {
+                    return Err(format!("setArgV0 指针写入失败且 setcontext GOT 不可用: {}", e));
+                }
+                if block_in_setcontext_flag_offset + 8 > payload_data.len() {
+                    return Err(format!(
+                        "block_in_setcontext 偏移越界: {} + 8 > {}",
+                        block_in_setcontext_flag_offset,
+                        payload_data.len()
+                    ));
+                }
+                let flag_addr = loc.base + block_in_setcontext_flag_offset as u64;
+                mem.pwrite_all(&1u64.to_ne_bytes(), flag_addr).map_err(|flag_err| {
+                    format!(
+                        "setArgV0 指针写入失败后启用 setcontext-only 也失败: setArgV0_error={} flag_error={}",
+                        e, flag_err
+                    )
+                })?;
+                log_warn!(
+                    "setArgV0 指针写入失败，改用 setcontext-only 阻塞: slot=0x{:x}, error={}",
+                    addr,
+                    e
+                );
+                None
+            }
+        }
     } else {
         // 降级模式：block_in_setcontext 已置 1，阻塞由 setcontext GOT 替换承担
         None
@@ -1919,14 +1985,8 @@ struct LibcFunctions {
 
 /// 解析 libc.so 获取所需函数地址
 fn resolve_libc_functions(maps: &[MapEntry]) -> Result<LibcFunctions, String> {
-    // 找到 libc.so 在目标进程中的基址和路径
-    // 取所有 libc.so 映射中 start 最小的作为基址（与 Frida find_module_by_path 一致）
-    let (libc_base, libc_path) = maps
-        .iter()
-        .filter(|e| e.path.ends_with("/libc.so"))
-        .min_by_key(|e| e.start)
-        .map(|e| (e.start, e.path.clone()))
-        .ok_or_else(|| "未找到 libc.so".to_string())?;
+    // 找到 libc.so 在目标进程中的真实装载基址和路径。
+    let (libc_base, libc_path) = find_loaded_module(maps, "/libc.so").ok_or_else(|| "未找到 libc.so".to_string())?;
 
     log_verbose!("libc.so 基址: 0x{:x}, 路径: {}", libc_base, libc_path);
 
@@ -1958,11 +2018,7 @@ fn resolve_libc_functions(maps: &[MapEntry]) -> Result<LibcFunctions, String> {
 /// 在 maps 中找到指定 SO 的导出符号地址
 fn find_export_in_maps(maps: &[MapEntry], so_name: &str, symbol_name: &str) -> Result<u64, String> {
     let suffix = format!("/{}", so_name);
-    let (base, path) = maps
-        .iter()
-        .find(|e| e.path.ends_with(&suffix) && e.offset == 0)
-        .map(|e| (e.start, e.path.clone()))
-        .ok_or_else(|| format!("未找到 {}", so_name))?;
+    let (base, path) = find_loaded_module(maps, &suffix).ok_or_else(|| format!("未找到 {}", so_name))?;
 
     let elf_data = std::fs::read(&path).map_err(|e| format!("读取 {} 失败: {}", path, e))?;
     let elf = goblin::elf::Elf::parse(&elf_data).map_err(|e| format!("解析 {} 失败: {}", so_name, e))?;
@@ -1974,14 +2030,7 @@ fn find_export_in_maps(maps: &[MapEntry], so_name: &str, symbol_name: &str) -> R
 /// 返回 Some((函数地址, Option<GOT地址>))
 fn find_setcontext_info(maps: &[MapEntry]) -> Option<(u64, Option<u64>)> {
     // 先找 libselinux.so 中的导出
-    let selinux_entry = maps
-        .iter()
-        .find(|e| e.path.ends_with("/libselinux.so") && e.offset == 0);
-
-    let func_addr = if let Some(entry) = selinux_entry {
-        let path = &entry.path;
-        let base = entry.start;
-
+    let func_addr = if let Some((base, path)) = find_loaded_module(maps, "/libselinux.so") {
         std::fs::read(path).ok().and_then(|data| {
             goblin::elf::Elf::parse(&data)
                 .ok()
@@ -2002,9 +2051,7 @@ fn find_setcontext_info(maps: &[MapEntry]) -> Option<(u64, Option<u64>)> {
 /// 在指定 SO 的 GOT 中查找对某个导入符号的引用
 fn find_got_entry_for_import(maps: &[MapEntry], so_name: &str, import_name: &str) -> Option<u64> {
     let suffix = format!("/{}", so_name);
-    let entry = maps.iter().find(|e| e.path.ends_with(&suffix) && e.offset == 0)?;
-    let base = entry.start;
-    let path = &entry.path;
+    let (base, path) = find_loaded_module(maps, &suffix)?;
 
     let elf_data = std::fs::read(path).ok()?;
     let elf = goblin::elf::Elf::parse(&elf_data).ok()?;
@@ -2053,33 +2100,62 @@ fn find_setargv0_pointer_in_heap(
         let mut matches = Vec::new();
 
         for entry in candidates {
-            let size = (entry.end - entry.start) as usize;
-            let mut buf = vec![0u8; size];
+            let size = entry.end.saturating_sub(entry.start);
+            let mut pos = 0u64;
+            let mut buf = vec![0u8; SETARGV0_SCAN_CHUNK_SIZE];
+            let mut read_errors = 0usize;
 
-            if mem.pread_exact(&mut buf, entry.start).is_err() {
-                continue;
-            }
-
-            // 搜索 original needle（指针 8 字节对齐）
-            for offset in (0..buf.len().saturating_sub(7)).step_by(8) {
-                if buf[offset..offset + 8] == original_needle {
-                    let addr = entry.start + offset as u64;
-                    let mut backup = [0u8; 8];
-                    backup.copy_from_slice(&original_needle);
-                    matches.push((addr, backup, false, entry.path.clone(), entry.is_executable()));
-                }
-            }
-
-            // 搜索 replaced needle（already-patched 检测）
-            if let Some(ref replaced) = replaced_needle {
-                for offset in (0..buf.len().saturating_sub(7)).step_by(8) {
-                    if buf[offset..offset + 8] == *replaced {
-                        let addr = entry.start + offset as u64;
+            let mut scan_buf = |chunk_base: u64, chunk: &[u8]| {
+                // 搜索 original needle（指针 8 字节对齐）
+                for offset in (0..chunk.len().saturating_sub(7)).step_by(8) {
+                    if chunk[offset..offset + 8] == original_needle {
+                        let addr = chunk_base + offset as u64;
                         let mut backup = [0u8; 8];
                         backup.copy_from_slice(&original_needle);
-                        matches.push((addr, backup, true, entry.path.clone(), entry.is_executable()));
+                        matches.push((addr, backup, false, entry.path.clone(), entry.is_executable()));
                     }
                 }
+
+                // 搜索 replaced needle（already-patched 检测）
+                if let Some(ref replaced) = replaced_needle {
+                    for offset in (0..chunk.len().saturating_sub(7)).step_by(8) {
+                        if chunk[offset..offset + 8] == *replaced {
+                            let addr = chunk_base + offset as u64;
+                            let mut backup = [0u8; 8];
+                            backup.copy_from_slice(&original_needle);
+                            matches.push((addr, backup, true, entry.path.clone(), entry.is_executable()));
+                        }
+                    }
+                }
+            };
+
+            while pos < size {
+                let want = SETARGV0_SCAN_CHUNK_SIZE.min((size - pos) as usize);
+                let chunk_base = entry.start + pos;
+                match mem.pread_exact(&mut buf[..want], chunk_base) {
+                    Ok(()) => scan_buf(chunk_base, &buf[..want]),
+                    Err(_) => {
+                        read_errors += 1;
+                        let mut page_pos = 0usize;
+                        while page_pos < want {
+                            let page_want = 4096usize.min(want - page_pos);
+                            let page_base = chunk_base + page_pos as u64;
+                            if mem.pread_exact(&mut buf[..page_want], page_base).is_ok() {
+                                scan_buf(page_base, &buf[..page_want]);
+                            }
+                            page_pos += page_want;
+                        }
+                    }
+                }
+                pos += want as u64;
+            }
+
+            if read_errors > 0 {
+                log_verbose!(
+                    "setArgV0 扫描 {} 发生 {} 个大块读取失败，已按页回退",
+                    entry.path,
+                    read_errors
+                );
             }
         }
 
@@ -2091,20 +2167,6 @@ fn find_setargv0_pointer_in_heap(
         matches.dedup_by_key(|(addr, _, _, _, _)| *addr);
 
         if matches.len() > 1 {
-            let runtime_matches: Vec<_> = matches
-                .iter()
-                .filter(|(_, _, _, path, _)| path.ends_with("/libandroid_runtime.so"))
-                .cloned()
-                .collect();
-            if runtime_matches.len() == 1 {
-                let (addr, backup, already_patched, _, _) = runtime_matches[0].clone();
-                log_warn!(
-                    "多个 setArgV0 候选中优先选择 libandroid_runtime.so 内的 slot: 0x{:x}",
-                    addr
-                );
-                return Ok(Some((addr, backup, already_patched)));
-            }
-
             let non_exec_matches: Vec<_> = matches
                 .iter()
                 .filter(|(_, _, _, _, is_exec)| !*is_exec)

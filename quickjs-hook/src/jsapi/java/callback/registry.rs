@@ -20,6 +20,7 @@ pub(super) enum HookType {
         replacement_addr: usize,
         per_method_hook_target: Option<u64>,
         original_flags_mutated: bool,
+        original_entry_mutated: bool,
     },
     /// Experimental quick callback hook.
     /// Router calls Rust directly and only uses replacement_addr as a native
@@ -48,6 +49,16 @@ impl HookType {
                 ..
             } => *original_flags_mutated,
             HookType::Managed { .. } => true,
+        }
+    }
+
+    pub(super) fn original_entry_mutated(&self) -> bool {
+        match self {
+            HookType::Replaced {
+                original_entry_mutated,
+                ..
+            } => *original_entry_mutated,
+            _ => false,
         }
     }
 }

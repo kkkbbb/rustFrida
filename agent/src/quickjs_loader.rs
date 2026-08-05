@@ -18,7 +18,8 @@ use quickjs_hook::{
     set_qbdi_helper_blob, set_qbdi_output_dir,
 };
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::ptr;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc;
 use std::sync::{Condvar, Mutex, OnceLock};
 
@@ -35,6 +36,8 @@ static JAVA_WORKER_STARTED: AtomicBool = AtomicBool::new(false);
 static JAVA_WORKER_LOOP_ENTERED: AtomicBool = AtomicBool::new(false);
 static JAVA_WORKER_LOOP_RUNNING: AtomicBool = AtomicBool::new(false);
 static JAVA_WORKER_EVAL_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+static JAVA_WORKER_NATIVE_RELEASED: AtomicBool = AtomicBool::new(false);
+static JAVA_WORKER_TID: AtomicI32 = AtomicI32::new(0);
 static EXEC_MEM_UNMAPPED: AtomicBool = AtomicBool::new(false);
 static JAVA_WORKER_QUEUE: OnceLock<JavaWorkerQueue> = OnceLock::new();
 static HOOK_EXEC_VMA_NAME: &[u8] = b"wwb_hook_exec\0";
@@ -245,29 +248,52 @@ pub fn init() -> Result<(), String> {
     Ok(())
 }
 
-unsafe extern "C" fn java_worker_native_loop(_env: *mut *const *const std::ffi::c_void, _cls: *mut std::ffi::c_void) {
+unsafe extern "C" fn java_worker_native_loop(
+    _env: *mut *const *const std::ffi::c_void,
+    _cls: *mut std::ffi::c_void,
+) -> u8 {
+    JAVA_WORKER_TID.store(libc::syscall(libc::SYS_gettid) as i32, Ordering::Release);
     JAVA_WORKER_LOOP_ENTERED.store(true, Ordering::Release);
     JAVA_WORKER_LOOP_RUNNING.store(true, Ordering::Release);
-    let result = std::panic::catch_unwind(|| loop {
-        match JavaWorkerQueue::get().pop() {
-            JavaWorkerTask::Eval {
-                script,
-                filename,
-                init_engine,
-                reply,
-            } => {
-                let result = run_eval_task(&script, &filename, init_engine);
-                JAVA_WORKER_EVAL_IN_FLIGHT.store(false, Ordering::Release);
-                let _ = reply.send(result);
+    let result = std::panic::catch_unwind(|| match JavaWorkerQueue::get().pop() {
+        JavaWorkerTask::Eval {
+            script,
+            filename,
+            init_engine,
+            reply,
+        } => {
+            let result = run_eval_task(&script, &filename, init_engine);
+            JAVA_WORKER_EVAL_IN_FLIGHT.store(false, Ordering::Release);
+            let _ = reply.send(result);
+            true
+        }
+        JavaWorkerTask::Stop => {
+            let released = unsafe { quickjs_hook::finish_java_worker_thread_from_native(_env, _cls) };
+            match released {
+                Ok(()) => {
+                    JAVA_WORKER_NATIVE_RELEASED.store(true, Ordering::Release);
+                }
+                Err(err) => {
+                    write_stream(format!("[java worker] native release failed: {}", err).as_bytes());
+                }
             }
-            JavaWorkerTask::Stop => break,
+            false
         }
     });
-    if result.is_err() {
-        write_stream(b"[java worker] native loop panic");
+    match result {
+        Ok(true) => 1,
+        Ok(false) => {
+            JAVA_WORKER_EVAL_IN_FLIGHT.store(false, Ordering::Release);
+            JAVA_WORKER_LOOP_RUNNING.store(false, Ordering::Release);
+            0
+        }
+        Err(_) => {
+            write_stream(b"[java worker] native loop panic");
+            JAVA_WORKER_EVAL_IN_FLIGHT.store(false, Ordering::Release);
+            JAVA_WORKER_LOOP_RUNNING.store(false, Ordering::Release);
+            0
+        }
     }
-    JAVA_WORKER_EVAL_IN_FLIGHT.store(false, Ordering::Release);
-    JAVA_WORKER_LOOP_RUNNING.store(false, Ordering::Release);
 }
 
 fn run_eval_task(script: &str, filename: &str, init_engine: bool) -> Result<String, String> {
@@ -312,6 +338,8 @@ pub fn start_java_worker() -> Result<(), String> {
     });
     write_stream(b"[java worker] starting");
     JAVA_WORKER_LOOP_ENTERED.store(false, Ordering::Release);
+    JAVA_WORKER_NATIVE_RELEASED.store(false, Ordering::Release);
+    JAVA_WORKER_TID.store(0, Ordering::Release);
     JAVA_WORKER_START_REQUESTED.store(true, Ordering::Release);
     if let Err(err) = quickjs_hook::start_java_worker_thread(java_worker_native_loop as *mut std::ffi::c_void) {
         JAVA_WORKER_START_REQUESTED.store(false, Ordering::Release);
@@ -355,16 +383,28 @@ fn wait_java_worker_stopped(had_worker: bool, timeout_ms: u64) -> bool {
     if !had_worker {
         return true;
     }
-    let start = std::time::Instant::now();
+    let started = std::time::Instant::now();
     loop {
-        if JAVA_WORKER_LOOP_ENTERED.load(Ordering::Acquire) && !JAVA_WORKER_LOOP_RUNNING.load(Ordering::Acquire) {
-            return true;
+        let tid = JAVA_WORKER_TID.load(Ordering::Acquire);
+        let thread_exists = tid > 0 && unsafe { libc::syscall(libc::SYS_tgkill, libc::getpid(), tid, 0) } == 0;
+        if JAVA_WORKER_LOOP_ENTERED.load(Ordering::Acquire)
+            && !JAVA_WORKER_LOOP_RUNNING.load(Ordering::Acquire)
+            && !thread_exists
+        {
+            break;
         }
-        if start.elapsed() >= std::time::Duration::from_millis(timeout_ms) {
+        if started.elapsed() >= std::time::Duration::from_millis(timeout_ms) {
             return false;
         }
         crate::raw_thread::sleep_ms(5);
     }
+
+    if !JAVA_WORKER_NATIVE_RELEASED.load(Ordering::Acquire) {
+        write_stream(b"[java worker] native binding was not removed before thread exit");
+        return false;
+    }
+    JAVA_WORKER_TID.store(0, Ordering::Release);
+    JAVA_WORKER_LOOP_RUNNING.store(false, Ordering::Release);
     true
 }
 
@@ -665,19 +705,6 @@ pub fn cleanup_for_unload_leak_safe() -> bool {
     };
 
     stage("cleanup start (managed-safe unload)", &mut t);
-    let had_java_worker = stop_java_worker();
-    if wait_java_worker_stopped(had_java_worker, 800) {
-        stage("phase0 stop_java_worker", &mut t);
-    } else {
-        stage("phase0 stop_java_worker_timeout", &mut t);
-        log_msg(
-            "[quickjs] Java worker native loop still running; skip managed-safe unload to avoid unmapping agent code\n"
-                .to_string(),
-        );
-        detach_current_jni_thread();
-        stage("cleanup detach_jni_thread", &mut t);
-        return false;
-    }
     ENGINE_INITIALIZED.store(false, Ordering::SeqCst);
     quickjs_hook::recomp::set_cleanup_release_only(false);
     if quickjs_hook::raw_clone_java_executor_hook_active() {
@@ -713,6 +740,23 @@ pub fn cleanup_for_unload_leak_safe() -> bool {
         return false;
     }
 
+    // Stop the Java worker only after hook entry points are cut and all managed
+    // helper invocations have drained. Its final JNI call unregisters every
+    // generated helper native before the agent image can be unmapped.
+    let had_java_worker = stop_java_worker();
+    if wait_java_worker_stopped(had_java_worker, 800) {
+        stage("phase2 stop_java_worker", &mut t);
+    } else {
+        stage("phase2 stop_java_worker_timeout", &mut t);
+        log_msg(
+            "[quickjs] Java worker native loop still running; skip managed-safe unload to avoid unmapping agent code\n"
+                .to_string(),
+        );
+        detach_current_jni_thread();
+        stage("cleanup detach_jni_thread", &mut t);
+        return false;
+    }
+
     cut_art_controller_walkstack_guards();
     stage("phase3 cut_art_controller_walkstack_guards", &mut t);
     quickjs_hook::recomp::set_cleanup_release_only(true);
@@ -722,20 +766,14 @@ pub fn cleanup_for_unload_leak_safe() -> bool {
     let retained_recomp_ranges = crate::recompiler::get_retained_ranges();
     if !retained_recomp_ranges.is_empty() {
         log_msg(format!(
-            "[quickjs] managed-safe safepoint recomp ranges={}\n",
+            "[quickjs] managed-safe retaining inactive recomp ranges={}\n",
             retained_recomp_ranges.len()
         ));
-        if crate::safepoint::wait_until_clean(&retained_recomp_ranges, 2_500) {
-            let (recomp_ok, recomp_fail, recomp_bytes) = unsafe { crate::recompiler::munmap_retained_ranges() };
-            log_msg(format!(
-                "[quickjs] managed-safe munmap recomp: ok={} fail={} bytes={}\n",
-                recomp_ok, recomp_fail, recomp_bytes
-            ));
-            stage("phase3 munmap_retained_recomp", &mut t);
-        } else {
-            log_msg("[quickjs] managed-safe safepoint timeout: keep retained recomp pages mapped\n".to_string());
-            stage("phase3 retained_recomp_leaked", &mut t);
-        }
+        // release_all() has already restored the original execution mapping.
+        // Keep the now-inactive recomp pages mapped for this leak-safe unload:
+        // probing every app thread with an RT signal is incompatible with apps
+        // that own the same signal or install crash/anti-debug handlers.
+        stage("phase3 retained_recomp_mapped", &mut t);
     }
 
     free_art_controller_state();

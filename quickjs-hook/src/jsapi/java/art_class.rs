@@ -520,8 +520,10 @@ pub(crate) unsafe fn transition_current_thread_to_native_for_blocking(env: JniEn
 ///
 /// 策略:
 /// 1. dlsym TransitionFromSuspendedToRunnable — 最安全，处理 checkpoint 和 suspend flag
-/// 2. 直接写 state_and_flags — 轻量但跳过 checkpoint（操作时间 <1μs，风险极低）
-/// 3. 无切换 fallback — 接受微小 GC 竞争风险
+/// 2. 无切换 fallback — 接受微小 GC 竞争风险
+///
+/// 不能直接写 state_and_flags。该字段由 ART 原子更新 checkpoint/suspend flags，
+/// 绕过正式 transition 既没有获取 mutator lock，也会与 ART 的 flag 更新竞争。
 pub(in crate::jsapi::java) unsafe fn with_runnable_thread<F, R>(env: JniEnv, f: F) -> R
 where
     F: FnOnce() -> R,
@@ -532,8 +534,8 @@ where
         return f();
     }
 
-    // Capture the native/suspended state slot before entering Runnable. If symbol-based restore
-    // is unavailable, probing after the transition is too late because the state is Runnable.
+    // Capture the native/suspended state slot before entering Runnable so the successful symbol
+    // path can cache the state layout for attached-thread cleanup.
     let state_slot_before = detect_state_and_flags(thread);
 
     // Strategy 1: dlsym TransitionFromSuspendedToRunnable + full reverse transition.
@@ -567,39 +569,10 @@ where
         return result;
     }
 
-    // Strategy 2: 直接操作 state_and_flags 字段
-    if let Some((offset, native_state, encoding)) = state_slot_before {
-        let ptr = (thread as usize + offset) as *mut u32;
-        let original = std::ptr::read_volatile(ptr);
-
-        // 设置 state 为 kRunnable (保留 flags 不变)
-        let runnable_val = encoding.encode_state(original, encoding.runnable_value() as u32);
-        std::ptr::write_volatile(ptr, runnable_val);
-
-        output_verbose(&format!(
-            "[runnable] 直接状态切换: Thread+{:#x}, kNative({})→kRunnable({})",
-            offset,
-            native_state,
-            encoding.runnable_value()
-        ));
-
-        let result = f();
-
-        let after = std::ptr::read_volatile(ptr);
-        if encoding.flags(after) != encoding.flags(original) {
-            output_verbose(&format!(
-                "[runnable] direct fallback dropping pending flags: before={:#x}, after={:#x}",
-                encoding.flags(original),
-                encoding.flags(after)
-            ));
-        }
-        std::ptr::write_volatile(ptr, original);
-
-        return result;
-    }
-
-    // Strategy 3: 无法切换状态，直接执行（best effort）
-    output_verbose("[runnable] 状态切换不可用，直接执行（best effort）");
+    // ART hides these transitions on some releases. Never emulate them by writing
+    // state_and_flags: without the mutator lock this would not provide GC safety, and
+    // a concurrent checkpoint request can leave the thread in an invalid state.
+    output_verbose("[runnable] ART transition symbols unavailable; execute without state mutation");
     f()
 }
 

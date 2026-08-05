@@ -950,7 +950,7 @@ unsafe fn install_message_queue_executor_hook(env: JniEnv) -> bool {
         return false;
     }
 
-    let (hook_addr, sflag) = match super::art_controller::prepare_hook_target(poll_addr, std::ptr::null_mut()) {
+    let (hook_addr, sflag, real_addr) = match super::art_controller::prepare_hook_target(poll_addr, std::ptr::null_mut()) {
         Ok(v) => v,
         Err(e) => {
             crate::jsapi::console::output_verbose(&format!(
@@ -977,7 +977,7 @@ unsafe fn install_message_queue_executor_hook(env: JniEnv) -> bool {
     }
     if !super::art_controller::try_fixup_trampoline_pub(
         hook_ffi::hook_get_trampoline(hook_addr as *mut std::ffi::c_void),
-        poll_addr,
+        real_addr,
     ) {
         hook_ffi::hook_remove(hook_addr as *mut std::ffi::c_void);
         return false;
@@ -1023,7 +1023,7 @@ unsafe fn install_handler_dispatch_executor_hook(env: JniEnv) -> bool {
         return false;
     }
 
-    let (hook_addr, sflag) = match super::art_controller::prepare_hook_target(entry_point, std::ptr::null_mut()) {
+    let (hook_addr, sflag, real_addr) = match super::art_controller::prepare_hook_target(entry_point, std::ptr::null_mut()) {
         Ok(v) => v,
         Err(e) => {
             crate::jsapi::console::output_verbose(&format!(
@@ -1050,7 +1050,7 @@ unsafe fn install_handler_dispatch_executor_hook(env: JniEnv) -> bool {
     }
     if !super::art_controller::try_fixup_trampoline_pub(
         hook_ffi::hook_get_trampoline(hook_addr as *mut std::ffi::c_void),
-        entry_point,
+        real_addr,
     ) {
         hook_ffi::hook_remove(hook_addr as *mut std::ffi::c_void);
         return false;

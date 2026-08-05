@@ -53,6 +53,7 @@ pub use jsapi::java::art_controller::{
 };
 pub use jsapi::java::cleanup_java_hooks;
 pub use jsapi::java::detach_current_jni_thread;
+pub use jsapi::java::finish_java_worker_thread_from_native;
 pub use jsapi::java::java_subsystem_active_for_cleanup;
 pub use jsapi::java::raw_clone_java_executor_hook_active;
 pub use jsapi::java::start_java_worker_thread;

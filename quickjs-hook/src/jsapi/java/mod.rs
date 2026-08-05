@@ -65,6 +65,13 @@ pub fn start_java_worker_thread(native_loop: *mut std::ffi::c_void) -> Result<()
     }
 }
 
+pub unsafe fn finish_java_worker_thread_from_native(
+    env: *mut *const *const std::ffi::c_void,
+    worker_cls: *mut std::ffi::c_void,
+) -> Result<(), String> {
+    java_hook_api::finish_java_worker_thread_from_native(env, worker_cls)
+}
+
 pub(crate) unsafe fn decode_jobject_raw(env: jni_core::JniEnv, obj: *mut std::ffi::c_void) -> Option<u64> {
     art_class::decode_jobject(env, obj)
 }
@@ -496,6 +503,7 @@ unsafe extern "C" fn js_art_route_stats(
     let mut replacement_hits: u64 = 0;
     let mut do_call_table_hits: u64 = 0;
     let mut do_call_last_x0: u64 = 0;
+    let mut do_call_raw_last_x0: u64 = 0;
     let mut quick_pass_hits: u64 = 0;
     let mut quick_callback_calls: u64 = 0;
     let mut quick_skip_hits: u64 = 0;
@@ -512,6 +520,7 @@ unsafe extern "C" fn js_art_route_stats(
         &mut replacement_hits,
         &mut do_call_table_hits,
         &mut do_call_last_x0,
+        &mut do_call_raw_last_x0,
         &mut quick_pass_hits,
         &mut quick_callback_calls,
         &mut quick_skip_hits,
@@ -611,6 +620,11 @@ unsafe extern "C" fn js_art_route_stats(
         ctx,
         "doCallRouterLastX0",
         JSValue(ffi::JS_NewBigUint64(ctx, do_call_last_x0)),
+    );
+    obj_val.set_property(
+        ctx,
+        "doCallRawLastX0",
+        JSValue(ffi::JS_NewBigUint64(ctx, do_call_raw_last_x0)),
     );
     obj_val.set_property(
         ctx,
@@ -1422,6 +1436,8 @@ unsafe fn install_java_api(ctx_ptr: *mut ffi::JSContext) -> Result<ffi::JSValue,
     add_cfunction_to_object(ctx_ptr, java_obj, "_inspectArtMethod", js_java_inspect_art_method, 3);
     add_cfunction_to_object(ctx_ptr, java_obj, "_jitInfo", js_java_jit_info, 0);
     add_cfunction_to_object(ctx_ptr, java_obj, "compileMethod", js_java_compile_method, 4);
+    add_cfunction_to_object(ctx_ptr, java_obj, "optMethod", js_java_compile_method, 4);
+    add_cfunction_to_object(ctx_ptr, java_obj, "optimizeMethod", js_java_compile_method, 4);
     add_cfunction_to_object(ctx_ptr, java_obj, "fastMethod", js_java_fast_method, 3);
     add_cfunction_to_object(ctx_ptr, java_obj, "fastConstructor", js_java_fast_constructor, 3);
     add_cfunction_to_object(ctx_ptr, java_obj, "fastField", js_java_fast_field, 3);
@@ -1525,24 +1541,36 @@ pub fn register_java_api(ctx: &JSContext) {
 // Java hook 拆卸原子操作 — 供 js_java_unhook 和 cleanup_java_hooks 复用
 // ============================================================================
 
-/// 恢复 ArtMethod 原始 flags。
+/// 恢复 ArtMethod 原始 flags，以及 hook 安装时主动改写过的内部 entry。
 ///
 /// 目标 app/framework ArtMethod 的 entry_point_/data_ 不写外部地址，也不在
 /// cleanup 时用旧快照覆盖 ART 自己后续做出的更新。路由切断通过 code hook /
 /// ART shared entry hook 完成。
 pub(super) unsafe fn restore_art_method_fields(data: &JavaHookData) {
-    if !data.hook_type.original_flags_mutated() {
+    if !data.hook_type.original_flags_mutated() && !data.hook_type.original_entry_mutated() {
         return;
     }
     if let Some(spec) = ART_METHOD_SPEC.get() {
-        std::ptr::write_volatile(
-            (data.art_method as usize + spec.access_flags_offset) as *mut u32,
-            data.original_access_flags,
-        );
-        hook_ffi::hook_flush_cache(
-            (data.art_method as usize + spec.access_flags_offset) as *mut std::ffi::c_void,
-            4,
-        );
+        if data.hook_type.original_flags_mutated() {
+            std::ptr::write_volatile(
+                (data.art_method as usize + spec.access_flags_offset) as *mut u32,
+                data.original_access_flags,
+            );
+            hook_ffi::hook_flush_cache(
+                (data.art_method as usize + spec.access_flags_offset) as *mut std::ffi::c_void,
+                4,
+            );
+        }
+        if data.hook_type.original_entry_mutated() {
+            std::ptr::write_volatile(
+                (data.art_method as usize + spec.entry_point_offset) as *mut u64,
+                data.original_entry_point,
+            );
+            hook_ffi::hook_flush_cache(
+                (data.art_method as usize + spec.entry_point_offset) as *mut std::ffi::c_void,
+                8,
+            );
+        }
     }
 }
 

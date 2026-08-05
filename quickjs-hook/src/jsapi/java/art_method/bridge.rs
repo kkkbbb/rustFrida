@@ -16,6 +16,8 @@ pub(super) struct ArtBridgeFunctions {
     pub(super) quick_imt_conflict_trampoline: u64,
     /// Nterp 解释器入口点（Android 12+），0 表示不可用
     pub(super) nterp_entry_point: u64,
+    /// Nterp with-clinit 入口点（Android 12+），0 表示不可用
+    pub(super) nterp_with_clinit_entry_point: u64,
     /// art::interpreter::DoCall<> 模板实例地址（最多4个）
     pub(super) do_call_addrs: Vec<u64>,
     /// GC 同步: ConcurrentCopying::CopyingPhase 地址，0 表示不可用
@@ -130,6 +132,11 @@ pub(super) unsafe fn find_art_bridge_functions(
         // --- dlsym: Nterp 入口点 ---
         let nterp = find_nterp_entry_point();
         output_verbose(&format!("[art bridge] nterp_entry_point={:#x}", nterp));
+        let nterp_with_clinit = find_nterp_with_clinit_entry_point();
+        output_verbose(&format!(
+            "[art bridge] nterp_with_clinit_entry_point={:#x}",
+            nterp_with_clinit
+        ));
 
         // --- dlsym: DoCall 模板实例 ---
         let do_calls = find_do_call_symbols();
@@ -184,6 +191,7 @@ pub(super) unsafe fn find_art_bridge_functions(
             quick_resolution_trampoline: resolution_tramp,
             quick_imt_conflict_trampoline: imt_conflict,
             nterp_entry_point: nterp,
+            nterp_with_clinit_entry_point: nterp_with_clinit,
             do_call_addrs: do_calls,
             gc_copying_phase: gc_phase,
             gc_collect_internal: gc_collect,
@@ -408,7 +416,8 @@ unsafe fn find_classlinker_trampolines(_env: JniEnv) -> (u64, u64, u64, u64) {
 /// 查找 Nterp 解释器入口点（Android 12+ / API 31+）
 ///
 /// 策略 1: dlsym("art::interpreter::GetNterpEntryPoint") → 调用它获取入口点
-/// 策略 2: dlsym("ExecuteNterpImpl") — 直接查找（通常 LOCAL HIDDEN，可能失败）
+/// 策略 2: dlsym("OatQuickMethodHeader::NterpImpl") → 读取运行时 header 中的 entry
+/// 策略 3: dlsym("ExecuteNterpImpl") — 直接查找（通常 LOCAL HIDDEN，可能失败）
 /// 返回 0 表示不可用（Android 11 及以下无 Nterp）
 unsafe fn find_nterp_entry_point() -> u64 {
     // 策略 1: GetNterpEntryPoint 是一个返回入口点地址的函数
@@ -425,7 +434,14 @@ unsafe fn find_nterp_entry_point() -> u64 {
         }
     }
 
-    // 策略 2: ExecuteNterpImpl（LOCAL HIDDEN，通常无法通过 dlsym 访问）
+    if let Some(ep) = find_nterp_entry_from_header_symbol(
+        "_ZN3art20OatQuickMethodHeader9NterpImplE",
+        "OatQuickMethodHeader::NterpImpl",
+    ) {
+        return ep;
+    }
+
+    // 策略 3: ExecuteNterpImpl（LOCAL HIDDEN，通常无法通过 dlsym 访问）
     let func_ptr2 = libart_dlsym("ExecuteNterpImpl");
     if !func_ptr2.is_null() {
         output_verbose(&format!(
@@ -437,6 +453,34 @@ unsafe fn find_nterp_entry_point() -> u64 {
 
     output_verbose("[art bridge] Nterp 入口点不可用（Android 11 及以下）");
     0
+}
+
+unsafe fn find_nterp_with_clinit_entry_point() -> u64 {
+    find_nterp_entry_from_header_symbol(
+        "_ZN3art20OatQuickMethodHeader19NterpWithClinitImplE",
+        "OatQuickMethodHeader::NterpWithClinitImpl",
+    )
+    .unwrap_or(0)
+}
+
+unsafe fn find_nterp_entry_from_header_symbol(symbol: &str, label: &str) -> Option<u64> {
+    let header = libart_dlsym(symbol);
+    if header.is_null() {
+        return None;
+    }
+    let ep = *(header as *const u64) & PAC_STRIP_MASK;
+    if ep == 0 || !is_code_pointer(ep) {
+        output_verbose(&format!(
+            "[art bridge] {} rejected: header={:#x}, entry={:#x}",
+            label, header as u64, ep
+        ));
+        return None;
+    }
+    output_verbose(&format!(
+        "[art bridge] Nterp 入口点通过 {} 获取: header={:#x}, entry={:#x}",
+        label, header as u64, ep
+    ));
+    Some(ep)
 }
 
 /// 查找 art::interpreter::DoCall<> 模板实例（4个：bool×bool 组合）

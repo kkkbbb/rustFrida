@@ -150,11 +150,15 @@ pub(super) fn build_java_worker_dex(class_id: u64) -> Result<GeneratedJavaWorker
     ctor.return_void();
     class.direct_method("<init>", "V", Vec::new(), ACC_PUBLIC | ACC_CONSTRUCTOR, ctor.finish()?);
 
-    let native_loop = MethodRef::new(descriptor.clone(), "nativeLoop", "V", Vec::new());
-    class.native_direct_method("nativeLoop", "V", Vec::new(), ACC_PRIVATE | ACC_STATIC | ACC_NATIVE);
+    let native_loop = MethodRef::new(descriptor.clone(), "nativeLoop", "Z", Vec::new());
+    class.native_direct_method("nativeLoop", "Z", Vec::new(), ACC_PRIVATE | ACC_STATIC | ACC_NATIVE);
 
     let mut run = DexIrBuilder::new(1, 1, 0);
+    let loop_label = run.new_label();
+    run.bind(loop_label)?;
     run.invoke_static(Vec::new(), native_loop.clone());
+    run.move_result(0);
+    run.if_nez(0, loop_label);
     run.return_void();
     class.virtual_method("run", "V", Vec::new(), ACC_PUBLIC, run.finish()?);
 

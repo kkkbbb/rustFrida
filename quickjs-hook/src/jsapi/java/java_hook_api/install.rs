@@ -7,13 +7,13 @@ use crate::jsapi::callback_util::{
 use crate::jsapi::console::output_verbose;
 use crate::value::JSValue;
 
-use super::super::art_controller::ensure_art_controller_initialized;
+use super::super::art_controller::{ensure_art_controller_initialized, ensure_shared_entry_router_hook};
 use super::super::art_method::*;
 use super::super::callback::*;
 use super::super::jni_core::*;
 use super::install_support::{
     alloc_art_method_clone, create_class_global_ref, create_replacement_art_method, install_per_method_router_hook,
-    update_original_method_flags_for_hook, JavaHookInstallGuard,
+    JavaHookInstallGuard,
 };
 
 fn is_registered_native_entry_candidate(addr: u64, bridge: &ArtBridgeFunctions) -> bool {
@@ -25,6 +25,7 @@ fn is_registered_native_entry_candidate(addr: u64, bridge: &ArtBridgeFunctions) 
         || addr == bridge.quick_resolution_trampoline
         || addr == bridge.quick_imt_conflict_trampoline
         || addr == bridge.nterp_entry_point
+        || addr == bridge.nterp_with_clinit_entry_point
         || (bridge.resolved_jni_entrypoint != 0 && addr == bridge.resolved_jni_entrypoint)
         || (bridge.resolved_interpreter_bridge_entrypoint != 0 && addr == bridge.resolved_interpreter_bridge_entrypoint)
         || (bridge.resolved_resolution_entrypoint != 0 && addr == bridge.resolved_resolution_entrypoint)
@@ -44,6 +45,84 @@ fn is_registered_native_entry_candidate(addr: u64, bridge: &ArtBridgeFunctions) 
         return false;
     }
     (entry.prot_flags() & libc::PROT_EXEC) != 0
+}
+
+fn is_known_shared_router_entry(addr: u64, bridge: &ArtBridgeFunctions) -> bool {
+    addr == bridge.quick_to_interpreter_bridge || addr == bridge.quick_resolution_trampoline
+}
+
+unsafe fn normalize_internal_shared_entry_if_needed(
+    art_method: u64,
+    ep_offset: usize,
+    env: JniEnv,
+    bridge: &ArtBridgeFunctions,
+    reason: &str,
+) -> bool {
+    if bridge.quick_to_interpreter_bridge == 0 {
+        return false;
+    }
+    let current_entry_point = read_entry_point(art_method, ep_offset);
+    if !is_art_quick_entrypoint(current_entry_point, bridge)
+        || is_known_shared_router_entry(current_entry_point, bridge)
+    {
+        return false;
+    }
+
+    std::ptr::write_volatile(
+        (art_method as usize + ep_offset) as *mut u64,
+        bridge.quick_to_interpreter_bridge,
+    );
+    hook_ffi::hook_flush_cache((art_method as usize + ep_offset) as *mut std::ffi::c_void, 8);
+    if let Err(msg) = ensure_shared_entry_router_hook(reason, bridge.quick_to_interpreter_bridge, ep_offset, env, false)
+    {
+        output_verbose(&format!(
+            "[java hook] {} interpreter bridge router ensure failed: {}",
+            reason, msg
+        ));
+    }
+    output_verbose(&format!(
+        "[java hook] {} shared entry normalized: {:#x} -> interpreter bridge {:#x}",
+        reason, current_entry_point, bridge.quick_to_interpreter_bridge
+    ));
+    true
+}
+
+fn mark_original_entry_mutated(art_method: u64) {
+    with_registry_mut(&JAVA_HOOK_REGISTRY, |registry| {
+        if let Some(hook_data) = registry.get_mut(&art_method) {
+            if let HookType::Replaced {
+                original_entry_mutated, ..
+            } = &mut hook_data.hook_type
+            {
+                *original_entry_mutated = true;
+            }
+        }
+    });
+}
+
+fn schedule_internal_shared_entry_refresh(art_method: u64, ep_offset: usize, bridge: &'static ArtBridgeFunctions) {
+    let _ = crate::raw_thread::spawn_detached(b"rf-art-refresh\0", move || {
+        for delay_ms in [120_i64, 400, 900] {
+            crate::raw_thread::sleep_ms(delay_ms);
+            let still_registered =
+                with_registry(&JAVA_HOOK_REGISTRY, |registry| registry.contains_key(&art_method)).unwrap_or(false);
+            if !still_registered {
+                return;
+            }
+            let refreshed = unsafe {
+                normalize_internal_shared_entry_if_needed(
+                    art_method,
+                    ep_offset,
+                    std::ptr::null_mut(),
+                    bridge,
+                    "delayed-entry-refresh",
+                )
+            };
+            if refreshed {
+                mark_original_entry_mutated(art_method);
+            }
+        }
+    });
 }
 
 unsafe fn free_callback_bytes(ctx: *mut ffi::JSContext, callback_bytes: [u8; 16]) {
@@ -137,35 +216,6 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
         }
     };
 
-    init_java_registry();
-    if with_registry(&JAVA_HOOK_REGISTRY, |r| r.contains_key(&art_method)).unwrap_or(false) {
-        let new_callback_bytes = dup_callback_to_bytes(ctx, callback_arg.raw());
-
-        let old_callback_bytes = with_registry_mut(&JAVA_HOOK_REGISTRY, |registry| {
-            if let Some(hook_data) = registry.get_mut(&art_method) {
-                let old_bytes = hook_data.callback_bytes;
-                hook_data.callback_bytes = new_callback_bytes;
-                hook_data.ctx = ctx as usize;
-                Some(old_bytes)
-            } else {
-                None
-            }
-        })
-        .flatten();
-
-        if let Some(old_bytes) = old_callback_bytes {
-            let old_callback: ffi::JSValue = std::ptr::read(old_bytes.as_ptr() as *const ffi::JSValue);
-            ffi::qjs_free_value(ctx, old_callback);
-        }
-
-        output_verbose(&format!(
-            "[java hook] 回调已替换: {}.{}{}",
-            class_name, method_name, actual_sig
-        ));
-
-        return JSValue::bool(true).raw();
-    }
-
     let spec = get_art_method_spec(env, art_method);
     let ep_offset = spec.entry_point_offset;
     let data_off = spec.data_offset;
@@ -188,17 +238,54 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
         }
     }
 
-    let clone_size = spec.size;
-    let clone_addr = match alloc_art_method_clone(art_method, clone_size) {
-        Ok(addr) => addr,
-        Err(msg) => return throw_internal_error(ctx, msg),
-    };
-
     let bridge = find_art_bridge_functions(env, ep_offset);
     let jni_trampoline = bridge.quick_generic_jni_trampoline;
     if jni_trampoline == 0 {
         return throw_internal_error(ctx, "failed to find art_quick_generic_jni_trampoline");
     }
+
+    init_java_registry();
+    if with_registry(&JAVA_HOOK_REGISTRY, |r| r.contains_key(&art_method)).unwrap_or(false) {
+        let refreshed_entry = (original_access_flags & K_ACC_NATIVE) == 0
+            && normalize_internal_shared_entry_if_needed(art_method, ep_offset, env, bridge, "existing-hook-refresh");
+        let new_callback_bytes = dup_callback_to_bytes(ctx, callback_arg.raw());
+
+        let old_callback_bytes = with_registry_mut(&JAVA_HOOK_REGISTRY, |registry| {
+            if let Some(hook_data) = registry.get_mut(&art_method) {
+                let old_bytes = hook_data.callback_bytes;
+                hook_data.callback_bytes = new_callback_bytes;
+                hook_data.ctx = ctx as usize;
+                Some(old_bytes)
+            } else {
+                None
+            }
+        })
+        .flatten();
+
+        if let Some(old_bytes) = old_callback_bytes {
+            let old_callback: ffi::JSValue = std::ptr::read(old_bytes.as_ptr() as *const ffi::JSValue);
+            ffi::qjs_free_value(ctx, old_callback);
+        }
+        if refreshed_entry {
+            mark_original_entry_mutated(art_method);
+        }
+        if (original_access_flags & K_ACC_NATIVE) == 0 {
+            schedule_internal_shared_entry_refresh(art_method, ep_offset, bridge);
+        }
+
+        output_verbose(&format!(
+            "[java hook] 回调已替换: {}.{}{} entry_refreshed={}",
+            class_name, method_name, actual_sig, refreshed_entry
+        ));
+
+        return JSValue::bool(true).raw();
+    }
+
+    let clone_size = spec.size;
+    let clone_addr = match alloc_art_method_clone(art_method, clone_size) {
+        Ok(addr) => addr,
+        Err(msg) => return throw_internal_error(ctx, msg),
+    };
 
     let class_global_ref = match create_class_global_ref(env, &class_name) {
         Ok(gref) => gref,
@@ -246,15 +333,12 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
     let is_native_method = (original_access_flags & K_ACC_NATIVE) != 0;
     let is_shared_jni_entry = original_entry_point == bridge.quick_generic_jni_trampoline
         || (bridge.resolved_jni_entrypoint != 0 && original_entry_point == bridge.resolved_jni_entrypoint);
-    let has_registered_native_entry = is_native_method
-        && original_data != 0
-        && is_registered_native_entry_candidate(original_data, bridge);
+    let has_registered_native_entry =
+        is_native_method && original_data != 0 && is_registered_native_entry_candidate(original_data, bridge);
     let shared_native_art_entry = is_native_method && !has_independent_code && !has_registered_native_entry;
     let native_entry_is_quick_entry = has_registered_native_entry && original_entry_point == original_data;
-    let route_has_independent_code =
-        (has_independent_code && !native_entry_is_quick_entry) || shared_native_art_entry;
-    let shared_jni_native_router = is_native_method && shared_native_art_entry && !has_registered_native_entry;
-    let mutate_original_method_flags = !shared_jni_native_router;
+    let route_has_independent_code = (has_independent_code && !native_entry_is_quick_entry) || shared_native_art_entry;
+    let mutate_original_method_flags = false;
 
     output_verbose(&format!(
         "[java hook] Step 4: has_independent_code={} route_independent={} native={} shared_jni={} shared_native_art_entry={} registered_native={} (data={:#x}, ep={:#x})",
@@ -305,7 +389,7 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
             Some(java_hook_callback)
         };
         let install_native_entry = (|| -> Result<(u64, u64, u64), String> {
-            let (hook_addr, sflag) =
+            let (hook_addr, sflag, real_addr) =
                 super::super::art_controller::prepare_hook_target(original_data, std::ptr::null_mut())
                     .map_err(|e| format!("registered native entry prepare: {}", e))?;
             let trampoline = hook_ffi::hook_replace(
@@ -320,7 +404,7 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
                     original_data, hook_addr
                 ));
             }
-            super::super::art_controller::try_fixup_trampoline_pub(trampoline, original_data);
+            super::super::art_controller::try_fixup_trampoline_pub(trampoline, real_addr);
             std::ptr::write_volatile((clone_addr as usize + data_off) as *mut u64, trampoline as u64);
             std::ptr::write_volatile((clone_addr as usize + ep_offset) as *mut u64, jni_trampoline);
             Ok((original_data, hook_addr, trampoline as u64))
@@ -361,8 +445,8 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
         }
     }
 
-    // Clone+Replace 模式 (对标 Frida):
-    // 原始 ArtMethod 仅修改 flags (deopt)，不设 kAccNative。
+    // Clone+Replace 模式:
+    // 原始 ArtMethod 不改 flags，不设 kAccNative；避免安装 hook 时触发 deopt 可观测面。
     // replacement ArtMethod (heap) 设为 kAccNative + jniCode=thunk + quickCode=jni_trampoline。
     // 通过 artController Layer 1+2+3 路由 original → replacement。
 
@@ -411,6 +495,7 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
                     replacement_addr,
                     per_method_hook_target: None,
                     original_flags_mutated: mutate_original_method_flags,
+                    original_entry_mutated: false,
                 },
                 clone_addr,
                 class_global_ref,
@@ -435,27 +520,32 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
     // B2: Layer 3 per-method router hook (对标 Frida ArtQuickCodeInterceptor)。
     // 此时 replacement 尚未加入 art_router 表；若其他线程打到 quickCode，会继续走原始方法，
     // 避免热点方法在半安装窗口进入 JS callback。
-    let (per_method_hook_target, quick_trampoline, use_blr, _router_thunk_body) = match install_per_method_router_hook(
-        route_has_independent_code,
-        original_entry_point,
-        &bridge,
-        ep_offset,
-        env,
-        art_method,
-        is_native_method,
-        shared_native_art_entry,
-        enable_fast_orig,
-    ) {
-        Ok(v) => v,
-        Err(msg) => {
-            if let Some(removed) =
-                with_registry_mut(&JAVA_HOOK_REGISTRY, |registry| registry.remove(&art_method)).flatten()
-            {
-                free_callback_bytes(ctx, removed.callback_bytes);
+    let (per_method_hook_target, quick_trampoline, use_blr, _router_thunk_body, mut original_entry_mutated) =
+        match install_per_method_router_hook(
+            route_has_independent_code,
+            original_entry_point,
+            &bridge,
+            ep_offset,
+            env,
+            art_method,
+            is_native_method,
+            shared_native_art_entry,
+            enable_fast_orig,
+            true,
+        ) {
+            Ok(v) => v,
+            Err(msg) => {
+                if let Some(removed) =
+                    with_registry_mut(&JAVA_HOOK_REGISTRY, |registry| registry.remove(&art_method)).flatten()
+                {
+                    free_callback_bytes(ctx, removed.callback_bytes);
+                }
+                return throw_internal_error(ctx, msg);
             }
-            return throw_internal_error(ctx, msg);
-        }
-    };
+        };
+    if original_entry_mutated {
+        install_guard.set_original_entry_mutated();
+    }
 
     with_registry_mut(&JAVA_HOOK_REGISTRY, |registry| {
         if let Some(hook_data) = registry.get_mut(&art_method) {
@@ -463,6 +553,7 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
                 replacement_addr,
                 per_method_hook_target,
                 original_flags_mutated: mutate_original_method_flags,
+                original_entry_mutated,
             };
             hook_data.quick_trampoline = quick_trampoline;
             hook_data.use_blr = use_blr;
@@ -473,16 +564,23 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
     set_replacement_method(art_method, replacement_addr as u64);
     install_guard.set_replacement_registered();
 
-    if mutate_original_method_flags {
-        // B4: 修改原始 ArtMethod flags (对标 Frida android.js:3732-3741)
-        // 不设 kAccNative! 仅 deopt + 清除快速路径标志。放到最后，避免半安装状态暴露给其他线程。
-        update_original_method_flags_for_hook(art_method, spec.access_flags_offset, original_access_flags);
-        install_guard.set_original_method_mutated();
-    } else {
-        output_verbose(&format!(
-            "[java hook] shared JNI native router: original ArtMethod flags unchanged ({:#x})",
-            original_access_flags
-        ));
+    output_verbose(&format!(
+        "[java hook] no-deopt: original ArtMethod flags unchanged ({:#x})",
+        original_access_flags
+    ));
+
+    if !is_native_method
+        && normalize_internal_shared_entry_if_needed(art_method, ep_offset, env, bridge, "post-install")
+    {
+        original_entry_mutated = true;
+        install_guard.set_original_entry_mutated();
+    }
+
+    if original_entry_mutated {
+        mark_original_entry_mutated(art_method);
+    }
+    if !is_native_method {
+        schedule_internal_shared_entry_refresh(art_method, ep_offset, bridge);
     }
 
     let jni_trampoline_router_ready = super::super::art_controller::jni_trampoline_router_installed();
@@ -498,7 +596,7 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
         class_name
     ));
 
-    let strategy = if shared_jni_native_router {
+    let strategy = if is_native_method && shared_native_art_entry && !has_registered_native_entry {
         "native-shared-jni-router"
     } else if has_independent_code {
         if route_has_independent_code {
@@ -690,20 +788,22 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook_quick(
     install_guard.set_replacement_addr(replacement_addr);
 
     let is_constructor = method_name == "<init>";
-    let (per_method_hook_target, quick_trampoline, use_blr, _router_thunk_body) = match install_per_method_router_hook(
-        true,
-        original_entry_point,
-        &bridge,
-        ep_offset,
-        env,
-        art_method,
-        (original_access_flags & K_ACC_NATIVE) != 0,
-        is_constructor,
-        false,
-    ) {
-        Ok(v) => v,
-        Err(msg) => return throw_internal_error(ctx, msg),
-    };
+    let (per_method_hook_target, quick_trampoline, use_blr, _router_thunk_body, _original_entry_mutated) =
+        match install_per_method_router_hook(
+            true,
+            original_entry_point,
+            &bridge,
+            ep_offset,
+            env,
+            art_method,
+            (original_access_flags & K_ACC_NATIVE) != 0,
+            is_constructor,
+            false,
+            false,
+        ) {
+            Ok(v) => v,
+            Err(msg) => return throw_internal_error(ctx, msg),
+        };
 
     set_quick_callback_method(art_method, replacement_addr as u64, Some(java_hook_dispatch_from_quick));
     install_guard.set_replacement_registered();

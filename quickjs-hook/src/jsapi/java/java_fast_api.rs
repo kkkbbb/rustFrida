@@ -1607,10 +1607,7 @@ pub(crate) unsafe fn compile_art_method_to_quick(
             message: "Thread::Current() unavailable".to_string(),
         };
     };
-    let compile_sym = crate::jsapi::module::libart_dlsym(
-        "_ZN3art3jit3Jit13CompileMethodEPNS_9ArtMethodEPNS_6ThreadENS_15CompilationKindEb",
-    );
-    if compile_sym.is_null() {
+    let Some((compile_method, compile_symbol)) = find_jit_compile_method() else {
         return CompileResult {
             before,
             after: before,
@@ -1619,22 +1616,13 @@ pub(crate) unsafe fn compile_art_method_to_quick(
             kind: kind.label(),
             message: "Jit::CompileMethod symbol not found".to_string(),
         };
-    }
-
-    type CompileMethodFn =
-        unsafe extern "C" fn(this: u64, method: u64, thread: u64, compilation_kind: u32, prejit: u8) -> u8;
-    let compile_method: CompileMethodFn = std::mem::transmute(compile_sym);
+    };
 
     let mut last_kind = kind.label();
     let mut saw_compile_success = false;
     for k in kind.sequence() {
-        last_kind = match *k {
-            1 => "fast",
-            2 => "baseline",
-            3 => "optimized",
-            _ => "unknown",
-        };
-        let ok = compile_method(jit, art_method, thread, *k, 0) != 0;
+        last_kind = compile_method.label(*k);
+        let ok = compile_method.call(jit, art_method, thread, *k) != 0;
         let after = read_entry_point(art_method, entry_point_offset);
         if ok {
             saw_compile_success = true;
@@ -1646,7 +1634,7 @@ pub(crate) unsafe fn compile_art_method_to_quick(
                 success: true,
                 compiled: true,
                 kind: last_kind,
-                message: format!("Jit::CompileMethod({}) succeeded", last_kind),
+                message: format!("{}({}) succeeded", compile_symbol, last_kind),
             };
         }
     }
@@ -1664,6 +1652,107 @@ pub(crate) unsafe fn compile_art_method_to_quick(
             "Jit::CompileMethod returned false".to_string()
         },
     }
+}
+
+enum JitCompileMethod {
+    OsrOnly(unsafe extern "C" fn(this: u64, method: u64, thread: u64, osr: u8) -> u8),
+    BaselineOsr(unsafe extern "C" fn(this: u64, method: u64, thread: u64, baseline: u8, osr: u8) -> u8),
+    BaselineOsrPrejit(
+        unsafe extern "C" fn(this: u64, method: u64, thread: u64, baseline: u8, osr: u8, prejit: u8) -> u8,
+    ),
+    KindPrejit(unsafe extern "C" fn(this: u64, method: u64, thread: u64, compilation_kind: u32, prejit: u8) -> u8),
+    KindPrejitOsr(
+        unsafe extern "C" fn(this: u64, method: u64, thread: u64, compilation_kind: u32, prejit: u8, osr: u8) -> u8,
+    ),
+}
+
+impl JitCompileMethod {
+    unsafe fn call(&self, jit: u64, method: u64, thread: u64, compilation_kind: u32) -> u8 {
+        match self {
+            Self::OsrOnly(f) => f(jit, method, thread, 0),
+            Self::BaselineOsr(f) => f(jit, method, thread, Self::old_baseline_flag(compilation_kind), 0),
+            Self::BaselineOsrPrejit(f) => f(jit, method, thread, Self::old_baseline_flag(compilation_kind), 0, 0),
+            Self::KindPrejit(f) => f(jit, method, thread, compilation_kind, 0),
+            Self::KindPrejitOsr(f) => f(jit, method, thread, compilation_kind, 0, 0),
+        }
+    }
+
+    fn label(&self, compilation_kind: u32) -> &'static str {
+        match self {
+            Self::OsrOnly(_) => "jit",
+            Self::BaselineOsr(_) | Self::BaselineOsrPrejit(_) => {
+                if compilation_kind == 3 {
+                    "optimized"
+                } else {
+                    "baseline"
+                }
+            }
+            Self::KindPrejit(_) | Self::KindPrejitOsr(_) => match compilation_kind {
+                1 => "fast",
+                2 => "baseline",
+                3 => "optimized",
+                _ => "unknown",
+            },
+        }
+    }
+
+    fn old_baseline_flag(compilation_kind: u32) -> u8 {
+        if compilation_kind == 3 {
+            0
+        } else {
+            1
+        }
+    }
+}
+
+unsafe fn find_jit_compile_method() -> Option<(JitCompileMethod, &'static str)> {
+    let kind_prejit_osr_symbol = "_ZN3art3jit3Jit13CompileMethodEPNS_9ArtMethodEPNS_6ThreadENS_15CompilationKindEbb";
+    let kind_prejit_osr = crate::jsapi::module::libart_dlsym(kind_prejit_osr_symbol);
+    if !kind_prejit_osr.is_null() {
+        type CompileMethodFn =
+            unsafe extern "C" fn(this: u64, method: u64, thread: u64, compilation_kind: u32, prejit: u8, osr: u8) -> u8;
+        let compile_method: CompileMethodFn = std::mem::transmute(kind_prejit_osr);
+        return Some((JitCompileMethod::KindPrejitOsr(compile_method), kind_prejit_osr_symbol));
+    }
+
+    let kind_prejit_symbol = "_ZN3art3jit3Jit13CompileMethodEPNS_9ArtMethodEPNS_6ThreadENS_15CompilationKindEb";
+    let kind_prejit = crate::jsapi::module::libart_dlsym(kind_prejit_symbol);
+    if !kind_prejit.is_null() {
+        type CompileMethodFn =
+            unsafe extern "C" fn(this: u64, method: u64, thread: u64, compilation_kind: u32, prejit: u8) -> u8;
+        let compile_method: CompileMethodFn = std::mem::transmute(kind_prejit);
+        return Some((JitCompileMethod::KindPrejit(compile_method), kind_prejit_symbol));
+    }
+
+    let baseline_osr_prejit_symbol = "_ZN3art3jit3Jit13CompileMethodEPNS_9ArtMethodEPNS_6ThreadEbbb";
+    let baseline_osr_prejit = crate::jsapi::module::libart_dlsym(baseline_osr_prejit_symbol);
+    if !baseline_osr_prejit.is_null() {
+        type CompileMethodFn =
+            unsafe extern "C" fn(this: u64, method: u64, thread: u64, baseline: u8, osr: u8, prejit: u8) -> u8;
+        let compile_method: CompileMethodFn = std::mem::transmute(baseline_osr_prejit);
+        return Some((
+            JitCompileMethod::BaselineOsrPrejit(compile_method),
+            baseline_osr_prejit_symbol,
+        ));
+    }
+
+    let baseline_osr_symbol = "_ZN3art3jit3Jit13CompileMethodEPNS_9ArtMethodEPNS_6ThreadEbb";
+    let baseline_osr = crate::jsapi::module::libart_dlsym(baseline_osr_symbol);
+    if !baseline_osr.is_null() {
+        type CompileMethodFn = unsafe extern "C" fn(this: u64, method: u64, thread: u64, baseline: u8, osr: u8) -> u8;
+        let compile_method: CompileMethodFn = std::mem::transmute(baseline_osr);
+        return Some((JitCompileMethod::BaselineOsr(compile_method), baseline_osr_symbol));
+    }
+
+    let osr_only_symbol = "_ZN3art3jit3Jit13CompileMethodEPNS_9ArtMethodEPNS_6ThreadEb";
+    let osr_only = crate::jsapi::module::libart_dlsym(osr_only_symbol);
+    if !osr_only.is_null() {
+        type CompileMethodFn = unsafe extern "C" fn(this: u64, method: u64, thread: u64, osr: u8) -> u8;
+        let compile_method: CompileMethodFn = std::mem::transmute(osr_only);
+        return Some((JitCompileMethod::OsrOnly(compile_method), osr_only_symbol));
+    }
+
+    None
 }
 
 unsafe fn current_art_thread(env: JniEnv) -> Option<u64> {

@@ -318,9 +318,11 @@ static int validate_oat_inline_match(uint64_t addr, uint8_t* code_buf,
 static int scan_for_oat_inline_patterns(
     uint64_t scan_base, size_t scan_size,
     uint64_t full_base, size_t full_size,
+    uint64_t exclude_addr,
     uint64_t match_addrs[], OatInlineMatch match_infos[], int max_matches)
 {
     int count = 0;
+    const uint64_t exclude_size = 0x400;
 
     /* Scan directly from memory — libart r-x pages are readable.
      * Verify readability once; if not readable, use read_target_safe fallback. */
@@ -343,6 +345,11 @@ static int scan_for_oat_inline_patterns(
             uint64_t addr = scan_base + i * 4;
             OatInlineMatch match;
             if (validate_oat_inline_match(addr, (uint8_t*)&code[i], full_base, full_size, &match)) {
+                if (exclude_addr != 0 && addr >= exclude_addr && addr < exclude_addr + exclude_size) {
+                    hook_log("[oat_patch] skip match inside excluded GetOatQuickMethodHeader body at %#lx",
+                             (unsigned long)addr);
+                    continue;
+                }
                 match_addrs[count] = addr;
                 match_infos[count] = match;
                 count++;
@@ -363,6 +370,11 @@ static int scan_for_oat_inline_patterns(
 
             OatInlineMatch match;
             if (validate_oat_inline_match(addr, buf, full_base, full_size, &match)) {
+                if (exclude_addr != 0 && addr >= exclude_addr && addr < exclude_addr + exclude_size) {
+                    hook_log("[oat_patch] skip match inside excluded GetOatQuickMethodHeader body at %#lx",
+                             (unsigned long)addr);
+                    continue;
+                }
                 match_addrs[count] = addr;
                 match_infos[count] = match;
                 count++;
@@ -797,7 +809,7 @@ static int find_libart_range(uint64_t* exec_base, size_t* exec_size,
  * Public API
  * ============================================================================ */
 
-int hook_patch_inlined_oat_header_checks(void) {
+int hook_patch_inlined_oat_header_checks(uint64_t exclude_addr) {
     if (!g_engine.initialized) {
         hook_log("[oat_patch] hook engine not initialized");
         return HOOK_ERROR_NOT_INITIALIZED;
@@ -820,6 +832,7 @@ int hook_patch_inlined_oat_header_checks(void) {
     OatInlineMatch match_infos[MAX_OAT_INLINE_PATCHES];
     int match_count = scan_for_oat_inline_patterns(
         exec_base, exec_size, full_base, full_size,
+        exclude_addr,
         match_addrs, match_infos, MAX_OAT_INLINE_PATCHES);
 
     hook_log("[oat_patch] found %d inlined GetOatQuickMethodHeader patterns", match_count);

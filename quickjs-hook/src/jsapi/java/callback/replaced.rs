@@ -20,14 +20,24 @@ pub(in crate::jsapi::java) fn set_replacement_method(original: u64, replacement:
     }
 }
 
-/// Register original -> real Java replacement ArtMethod. Router mode 4 uses
+/// Register original -> real Java replacement ArtMethod. Router modes 4/5 use
 /// the normal replacement ABI but skips declaring_class_ synchronization,
 /// because replacement belongs to helper dex and is managed by ART/GC.
-pub(in crate::jsapi::java) fn set_managed_replacement_method(original: u64, replacement: u64, sentinel: u64) {
-    set_replacement_method(original, replacement);
+pub(in crate::jsapi::java) fn set_managed_replacement_method(
+    original: u64,
+    replacement: u64,
+    sentinel: u64,
+    uses_orig: bool,
+) {
+    REPLACED_METHODS.init();
+    REPLACED_METHODS.insert(original, replacement);
     unsafe {
-        hook_ffi::hook_art_router_table_set_mode(original, 4);
-        hook_ffi::hook_art_router_table_set_user_data(original, sentinel as *mut std::ffi::c_void);
+        hook_ffi::hook_art_router_table_add_managed_mode(
+            original,
+            replacement,
+            sentinel as *mut std::ffi::c_void,
+            if uses_orig { 4 } else { 5 },
+        );
     }
 }
 
@@ -57,9 +67,14 @@ pub(in crate::jsapi::java) fn set_quick_callback_method_mode(
     callback: hook_ffi::HookCallback,
     mode: u64,
 ) {
-    set_quick_callback_method(original, replacement, callback);
     unsafe {
-        hook_ffi::hook_art_router_table_set_mode(original, mode);
+        hook_ffi::hook_art_router_table_add_quick_mode(
+            original,
+            replacement,
+            callback,
+            original as *mut std::ffi::c_void,
+            mode,
+        );
     }
 }
 
